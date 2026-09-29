@@ -26,8 +26,13 @@ npm run dev                     # http://localhost:3000/health
 
 ```bash
 npm run db:test:deploy          # apply migrations to the test database
-npm test
+npm test                        # 185 tests (unit + API integration against PostgreSQL)
+npm test -- --coverage          # ~95% statements, ~85% branches
 ```
+
+Test files run one at a time (`maxWorkers: 1`) because they share one test database, which is
+emptied before each test. Concurrency is tested explicitly (`Promise.all`): double payment,
+payment vs cancel, and duplicate webhook deliveries.
 
 ### Other scripts
 
@@ -74,9 +79,30 @@ Every error response has the same shape:
 { "error": { "code": "VALIDATION_ERROR", "message": "Request validation failed", "details": {} } }
 ```
 
-Services throw `AppError` (400/401/403/404/409) for expected failures. The central `errorHandler`
-also maps Zod errors, malformed JSON and Prisma unique-constraint / not-found errors. Anything else
-returns a generic 500 without leaking internals.
+Services throw `AppError` for expected failures. The central `errorHandler` also maps Zod errors,
+request-body errors (malformed JSON, oversized or wrongly encoded bodies) and Prisma's
+unique / not-found / foreign-key errors (`P2002`, `P2025`, `P2003`) to generic messages — Prisma's
+own messages name tables and constraints. Anything else returns a generic 500; the stack trace
+goes only to the (structured JSON) log.
+
+### Status codes
+
+The same meaning everywhere in the API:
+
+| Status | Meaning                                                                                  |
+| ------ | ---------------------------------------------------------------------------------------- |
+| 200    | OK — including a webhook that was applied, a duplicate, or a conflict                    |
+| 201    | Created — including a payment whose outcome is `FAILED`                                  |
+| 202    | Accepted — payment created `PENDING`, awaiting the webhook                               |
+| 400    | Invalid payload, malformed JSON or malformed UUID                                        |
+| 401    | Missing, invalid or expired JWT; missing or wrong webhook secret                         |
+| 403    | Authenticated, but not an admin, on an admin-only write                                  |
+| 404    | Not found — **or owned by another user** (existence is never revealed)                   |
+| 409    | Duplicate record, or a state that doesn't allow the action (invalid transition)          |
+| 413    | Request body larger than 100 kb                                                          |
+| 415    | Unsupported request body encoding                                                        |
+| 422    | Well-formed but invalid combination: test not offered at centre; webhook amount mismatch |
+| 500    | Unexpected error (generic message only)                                                  |
 
 ## API endpoints
 
@@ -307,6 +333,60 @@ processed cleanly. If the event row were committed separately, a crash before th
 every retry look like a duplicate and the payment would never settle. (A test simulates exactly
 this crash.)
 
+## Edge cases
+
+Every case below has at least one automated test (`tests/`).
+
+| Area      | Case                                                        | Status              | Handled in                                                      |
+| --------- | ----------------------------------------------------------- | ------------------- | --------------------------------------------------------------- |
+| Auth      | Invalid signup payload                                      | 400                 | `validators/auth.validator.ts`                                  |
+| Auth      | Duplicate email (any letter case)                           | 409                 | email lowercased in validator; unique `users.email`             |
+| Auth      | Duplicate email, concurrent signups                         | 409                 | unique constraint, caught in `auth.service.ts`                  |
+| Auth      | Wrong password / unknown email (same message and timing)    | 401                 | `auth.service.ts` (dummy bcrypt compare)                        |
+| Auth      | Password over 72 **bytes** (bcrypt limit), signup and login | 400                 | `auth.validator.ts`                                             |
+| Auth      | `role: ADMIN` in signup body                                | 201 as USER         | Zod strips it; DB default `USER`                                |
+| Auth      | Missing / malformed / invalid / expired JWT, `alg: none`    | 401                 | `middleware/authenticate.ts`, `utils/jwt.ts` (HS256 pinned)     |
+| Catalogue | Malformed UUID / missing fields / bad price                 | 400                 | `validators/centre.validator.ts`; DB `CHECK (price > 0)`        |
+| Catalogue | Non-admin write / no token                                  | 403 / 401           | `middleware/requireAdmin.ts`                                    |
+| Catalogue | Unknown centre or test                                      | 404                 | `services/centre.service.ts`                                    |
+| Catalogue | Duplicate offering, test name, centre                       | 409                 | unique constraints, caught in services                          |
+| Bookings  | No token                                                    | 401                 | `routes/booking.routes.ts`                                      |
+| Bookings  | Unknown centre or test                                      | 404                 | `services/booking.service.ts`                                   |
+| Bookings  | Test not offered by the centre                              | 422                 | service check + composite FK to the offering                    |
+| Bookings  | Client sends `amount` / `status`                            | 400                 | strict schema                                                   |
+| Bookings  | Past / timezone-less / invalid appointment time             | 400                 | `validators/booking.validator.ts`                               |
+| Bookings  | Malformed / unknown booking ID                              | 400 / 404           | validator / owner-filtered query                                |
+| Bookings  | Viewing or cancelling another user's booking                | 404                 | `WHERE id AND user_id` in `booking.repository.ts`               |
+| Bookings  | Cancel twice / cancel FAILED / cancel after appointment     | 409                 | conditional UPDATE + `utils/bookingStatus.ts`                   |
+| Bookings  | Duplicate active booking (double click)                     | 409                 | partial unique index                                            |
+| Payments  | Unknown booking / another user's booking                    | 404                 | `lockForUser` in `payment.service.ts`                           |
+| Payments  | Booking FAILED / CANCELLED / past appointment               | 409                 | state machine check under row lock                              |
+| Payments  | Duplicate payment (incl. while PENDING, incl. concurrent)   | 409                 | row lock + unique `payments.booking_id`                         |
+| Payments  | Client sends `amount`                                       | 400                 | strict schema (amount always comes from the booking)            |
+| Payments  | Failed payment                                              | 201                 | not an error: `status: FAILED`, booking `FAILED`                |
+| Webhook   | Missing / wrong secret                                      | 401                 | `middleware/verifyWebhookSecret.ts` (timing-safe)               |
+| Webhook   | Invalid payload / `PENDING` status / malformed JSON         | 400                 | `paymentWebhookSchema` (strict)                                 |
+| Webhook   | Unknown event ID                                            | 200                 | not an error — a new event                                      |
+| Webhook   | Unknown `providerPaymentId`                                 | 404                 | `webhook.service.ts`                                            |
+| Webhook   | Amount mismatch                                             | 422                 | `webhook.service.ts`, nothing recorded                          |
+| Webhook   | Repeated SUCCESS / FAILED (same event ID, incl. concurrent) | 200                 | unique `provider_event_id`; stored result replayed              |
+| Webhook   | Same outcome, new event ID                                  | 200                 | `settlePayment()` → `DUPLICATE_STATE`                           |
+| Webhook   | Conflicting outcome / payment for a cancelled booking       | 200                 | `settlePayment()` → `IGNORED_CONFLICT` / booking kept CANCELLED |
+| Webhook   | Crash mid-processing                                        | 500, retry succeeds | single transaction rolls back                                   |
+| General   | Unknown route or method                                     | 404 (JSON)          | `middleware/notFound.ts`                                        |
+| General   | Body over 100 kb / unsupported encoding                     | 413 / 415           | `middleware/errorHandler.ts`                                    |
+| General   | Unexpected / database error                                 | 500                 | generic body; details only in logs                              |
+| General   | Password or hash in any response                            | never               | `select` on user queries; sweep test over all responses         |
+
+### Transaction boundaries
+
+| Operation                                  | Mechanism                                                         | Why                                                       |
+| ------------------------------------------ | ----------------------------------------------------------------- | --------------------------------------------------------- |
+| Payment (`POST /payments`)                 | Interactive transaction + `SELECT … FOR UPDATE` on booking        | Several reads and two writes depend on current status     |
+| Webhook processing                         | Transaction + booking row lock; event row in the same transaction | A crash can never leave an event recorded but not applied |
+| Cancellation                               | One conditional `UPDATE … WHERE status IN (…)`                    | A single statement is already atomic                      |
+| Signup, catalogue writes, booking creation | Single `INSERT`, guarded by unique constraints / FKs              | One statement is atomic; no multi-step invariant          |
+
 ## Database design
 
 ```
@@ -359,7 +439,10 @@ Key decisions:
 ## Assumptions
 
 - Emails are case-insensitive: they are trimmed and lowercased before being stored or looked up.
-- Passwords must be 8–72 characters (bcrypt ignores bytes beyond 72).
+- Passwords must be at least 8 characters and at most 72 **bytes** (bcrypt ignores anything
+  beyond 72 bytes; a multi-byte character such as `é` counts as 2). The limit applies at login too.
+- No `helmet`, CORS or rate limiting: the API returns only JSON and has no browser front end in
+  scope; the `X-Powered-By` header is disabled.
 - Login returns the same error for an unknown email and a wrong password, so the API does not
   reveal which emails are registered.
 - A JWT is trusted until it expires (default 1 hour); there are no refresh tokens or revocation.

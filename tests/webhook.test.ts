@@ -350,3 +350,20 @@ describe('the webhook never creates payments or bookings', () => {
     expect(await prisma.booking.count()).toBe(before.bookings);
   });
 });
+
+describe('concurrent duplicate delivery race', () => {
+  it('answers with the stored result when the unique event ID rejects the losing insert', async () => {
+    const first = await send(event());
+    // Open the race window: make the "already stored?" check miss once, as if another delivery
+    // committed just after we looked. The INSERT then hits the unique provider_event_id, the
+    // transaction rolls back, and the handler replies with the committed result.
+    jest.spyOn(paymentEventRepository, 'findByProviderEventId').mockResolvedValueOnce(null);
+
+    const second = await send(event());
+
+    expect(second.status).toBe(200);
+    expect(second.body).toEqual(first.body);
+    expect(await eventRows()).toHaveLength(1);
+    expect(await state()).toMatchObject({ payment: 'SUCCESS', booking: 'CONFIRMED' });
+  });
+});

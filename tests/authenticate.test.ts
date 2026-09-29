@@ -124,3 +124,17 @@ describe('requireAdmin middleware', () => {
     expect(res.status).toBe(201);
   });
 });
+
+describe('algorithm pinning', () => {
+  it('rejects an unsigned "alg: none" token claiming ADMIN', async () => {
+    const unsigned = jwt.sign({ email: admin.email, role: 'ADMIN' }, '', {
+      algorithm: 'none',
+      subject: admin.id,
+    });
+
+    const res = await request(app).post('/admin-only').set('Authorization', `Bearer ${unsigned}`);
+
+    expect(res.status).toBe(401);
+    expect(res.body.error.code).toBe('INVALID_TOKEN');
+  });
+});

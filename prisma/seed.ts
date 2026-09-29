@@ -2,11 +2,15 @@ import 'dotenv/config';
 import { z } from 'zod';
 import { prisma } from '../src/config/prisma';
 import { hashPassword } from '../src/utils/password';
+import { passwordWithinBcryptLimit } from '../src/validators/auth.validator';
 
 const adminSchema = z.object({
   ADMIN_NAME: z.string().trim().min(1).default('Admin'),
   ADMIN_EMAIL: z.string().trim().toLowerCase().pipe(z.email()),
-  ADMIN_PASSWORD: z.string().min(8).max(72),
+  ADMIN_PASSWORD: z
+    .string()
+    .min(8)
+    .refine(passwordWithinBcryptLimit, 'ADMIN_PASSWORD must be at most 72 bytes'),
 });
 
 /**

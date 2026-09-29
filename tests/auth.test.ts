@@ -1,5 +1,6 @@
 import request from 'supertest';
 import { createApp } from '../src/app';
+import { userRepository } from '../src/repositories/user.repository';
 import { verifyAccessToken } from '../src/utils/jwt';
 import { prisma, resetDatabase } from './helpers/db';
 
@@ -8,6 +9,7 @@ const app = createApp();
 const validUser = { name: 'Asha Rao', email: 'asha@example.com', password: 'password123' };
 
 beforeEach(resetDatabase);
+afterEach(() => jest.restoreAllMocks());
 afterAll(() => prisma.$disconnect());
 
 describe('POST /auth/signup', () => {
@@ -122,5 +124,51 @@ describe('POST /auth/login', () => {
 
     expect(res.status).toBe(400);
     expect(res.body.error.code).toBe('VALIDATION_ERROR');
+  });
+});
+
+describe('bcrypt 72-byte password limit', () => {
+  it('rejects a signup password over 72 bytes even when it is under 72 characters', async () => {
+    const password = 'é'.repeat(37); // 37 characters, 74 bytes
+
+    const res = await request(app)
+      .post('/auth/signup')
+      .send({ ...validUser, password });
+
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('VALIDATION_ERROR');
+  });
+
+  it('accepts a password of exactly 72 bytes', async () => {
+    const res = await request(app)
+      .post('/auth/signup')
+      .send({ ...validUser, password: 'é'.repeat(36) }); // 72 bytes
+
+    expect(res.status).toBe(201);
+  });
+
+  it('rejects a login password over 72 bytes (so a correct prefix plus extra bytes cannot match)', async () => {
+    await request(app).post('/auth/signup').send(validUser);
+
+    const res = await request(app)
+      .post('/auth/login')
+      .send({ email: validUser.email, password: validUser.password + 'x'.repeat(80) });
+
+    expect(res.status).toBe(400);
+  });
+});
+
+describe('concurrent signup race', () => {
+  it('returns 409 when the email is taken between the existence check and the insert', async () => {
+    await request(app).post('/auth/signup').send(validUser);
+    // Open the race window: pretend the first check saw no user, so the INSERT runs and the
+    // database unique constraint on email is what rejects it.
+    jest.spyOn(userRepository, 'existsByEmail').mockResolvedValueOnce(false);
+
+    const res = await request(app).post('/auth/signup').send(validUser);
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('EMAIL_ALREADY_REGISTERED');
+    expect(await prisma.user.count()).toBe(1);
   });
 });

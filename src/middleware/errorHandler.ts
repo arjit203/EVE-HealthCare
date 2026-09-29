@@ -31,14 +31,24 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
     );
   }
 
-  // Malformed JSON body (raised by express.json()).
+  // Request-body errors raised by express.json() (body-parser), identified by err.type.
   if (err?.type === 'entity.parse.failed') {
     return sendError(res, 400, 'INVALID_JSON', 'Malformed JSON body');
   }
+  if (err?.type === 'entity.too.large') {
+    return sendError(res, 413, 'PAYLOAD_TOO_LARGE', 'Request body is too large');
+  }
+  if (err?.type === 'encoding.unsupported' || err?.type === 'charset.unsupported') {
+    return sendError(res, 415, 'UNSUPPORTED_MEDIA_TYPE', 'Unsupported request body encoding');
+  }
 
+  // Services translate the constraint errors they expect; these are the fallbacks. The messages
+  // are deliberately generic: Prisma's own messages name tables, columns and constraints.
   if (err instanceof Prisma.PrismaClientKnownRequestError) {
     if (err.code === 'P2002') return sendError(res, 409, 'CONFLICT', 'Resource already exists');
     if (err.code === 'P2025') return sendError(res, 404, 'NOT_FOUND', 'Resource not found');
+    // Foreign key violation: a referenced record does not exist (nothing can be deleted).
+    if (err.code === 'P2003') return sendError(res, 404, 'NOT_FOUND', 'Related resource not found');
   }
 
   logger.error('Unhandled error', {
