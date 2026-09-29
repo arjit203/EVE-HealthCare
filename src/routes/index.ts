@@ -1,5 +1,6 @@
 import { Router } from 'express';
 import { authRouter } from './auth.routes';
+import { bookingRouter } from './booking.routes';
 import { centreRouter } from './centre.routes';
 import { diagnosticTestRouter } from './diagnosticTest.routes';
 
@@ -12,3 +13,4 @@ router.get('/health', (_req, res) => {
 router.use('/auth', authRouter);
 router.use('/centres', centreRouter);
 router.use('/tests', diagnosticTestRouter);
+router.use('/bookings', bookingRouter);

@@ -5,7 +5,7 @@ service and an idempotent payment webhook.
 
 **Stack:** Node.js · Express 5 · TypeScript · PostgreSQL · Prisma · Zod · JWT · Jest + Supertest
 
-> Status: authentication and diagnostic centres/tests are implemented. Bookings, payments and the
+> Status: authentication, diagnostic centres/tests and bookings are implemented. Payments and the
 > webhook are implemented in subsequent steps.
 
 ## Running locally
@@ -148,6 +148,51 @@ curl http://localhost:3000/centres/<centreId>/tests
 
 There are deliberately **no DELETE endpoints** — see Assumptions.
 
+### Bookings
+
+All booking routes require a token. Every user — including admins — only ever sees and cancels
+**their own** bookings.
+
+| Method | Path                   | Description                                      |
+| ------ | ---------------------- | ------------------------------------------------ |
+| POST   | `/bookings`            | Book `{ centreId, testId, appointmentDateTime }` |
+| GET    | `/bookings`            | The caller's bookings, newest first              |
+| GET    | `/bookings/:id`        | One of the caller's bookings                     |
+| PATCH  | `/bookings/:id/cancel` | Cancel one of the caller's bookings              |
+
+```bash
+curl -X POST http://localhost:3000/bookings   -H "Authorization: Bearer <token>" -H "Content-Type: application/json"   -d '{"centreId":"<centreId>","testId":"<testId>","appointmentDateTime":"2030-01-15T10:00:00+05:30"}'
+# 201 { "data": { "id": "…", "status": "PENDING", "amountPaise": 35000,
+#                 "appointmentDateTime": "2030-01-15T04:30:00.000Z",
+#                 "centre": { "id": "…", "name": "HealthFirst Diagnostics", "location": "…" },
+#                 "test": { "id": "…", "name": "Complete Blood Count (CBC)" }, … } }
+```
+
+The amount is **always** the centre's current price for that test; the request body is strict,
+so sending `amount`, `amountPaise` or `status` is rejected with 400.
+
+**Booking status rules** (defined once in `src/utils/bookingStatus.ts`):
+
+```
+PENDING ──payment succeeds──► CONFIRMED ──user cancels──► CANCELLED   (no refund; out of scope)
+   │  └──payment fails──────► FAILED       (terminal)
+   └──────user cancels──────► CANCELLED    (terminal)
+```
+
+| Situation                                                           | Status | `error.code`                |
+| ------------------------------------------------------------------- | ------ | --------------------------- |
+| Malformed id, bad/past/timezone-less time, unknown field (`amount`) | 400    | `VALIDATION_ERROR`          |
+| No token                                                            | 401    | `UNAUTHORIZED`              |
+| Booking doesn't exist **or belongs to another user**                | 404    | `NOT_FOUND`                 |
+| Centre or test in the body doesn't exist                            | 404    | `NOT_FOUND`                 |
+| Centre exists and test exists, but the centre doesn't offer it      | 422    | `TEST_NOT_OFFERED`          |
+| Same user, centre, test and time already booked (active)            | 409    | `DUPLICATE_BOOKING`         |
+| Cancelling a CANCELLED or FAILED booking                            | 409    | `INVALID_STATUS_TRANSITION` |
+| Cancelling after the appointment time                               | 409    | `APPOINTMENT_PASSED`        |
+
+Another user's booking returns **404, not 403**, so the API never reveals that a booking ID exists.
+This is enforced in the query itself (`WHERE id = ? AND user_id = ?`), not by fetching and comparing.
+
 ## Database design
 
 ```
@@ -162,7 +207,7 @@ users ──────────────────< bookings ──< p
 | `diagnostic_centres`    | Name + free-text location; unique `(name, location)`                                 |
 | `diagnostic_tests`      | Catalogue of test types (unique name, optional description)                          |
 | `centre_test_offerings` | Which centre offers which test, at what `price_paise`; unique `(centre_id, test_id)` |
-| `bookings`              | User, offering (→ centre + test), appointment time, `amount_paise` snapshot, status  |
+| `bookings`              | User, centre, test, `appointment_date_time`, `amount_paise` snapshot, status enum    |
 | `payments`              | Payment attempts for a booking; unique `provider_reference`                          |
 | `webhook_events`        | Every processed provider event; unique `event_id`                                    |
 
@@ -176,8 +221,15 @@ Key decisions:
   schema language cannot express CHECK constraints).
 - **Booking amount is a snapshot** of the centre's price at booking time, so later price changes
   do not alter existing bookings.
-- **Bookings reference the offering** (`offering_id`), so a booking can only be for a test the
+- **Bookings store `centre_id` + `test_id` with a composite foreign key** to the offering's unique
+  `(centre_id, test_id)`. The database itself guarantees that a booking is only ever for a test the
   centre actually offers.
+- **Duplicate active bookings are blocked** by a partial unique index on
+  `(user_id, centre_id, test_id, appointment_date_time) WHERE status IN ('PENDING','CONFIRMED')`.
+  A cancelled or failed slot can be booked again.
+- **Cancellation is atomic**: a single conditional `UPDATE … WHERE id AND user_id AND status IN
+(PENDING, CONFIRMED) AND appointment in the future`, so it cannot race with a payment update.
+- **No payment columns on `bookings`.** Payments point to the booking (one booking, many attempts).
 - **All foreign keys are `ON DELETE RESTRICT`**: a centre, test or offering that bookings refer to
   can never be deleted out from under them.
 - **One booking, many payment attempts** – a failed payment can be retried. A partial unique index
@@ -189,7 +241,14 @@ Key decisions:
 
 ## Assumptions
 
-- Timestamps are stored as `timestamptz`; clients send ISO-8601 datetimes.
+- Timestamps are stored as `timestamptz`. `appointmentDateTime` must be ISO 8601 **with a
+  timezone** (`Z` or `+05:30`) and in the future; responses are in UTC.
+- There is no slot/capacity management: any future time is bookable.
+- Admins have no special access to bookings; they see only their own.
+- A booking cannot be cancelled after its appointment time. Cancelling a CONFIRMED booking does not
+  trigger a refund (refunds are out of scope).
+- If a payment succeeds for a booking that is already CANCELLED, the payment is recorded but the
+  booking stays CANCELLED, and the event is logged.
 - Emails are case-insensitive: they are trimmed and lowercased before being stored or looked up.
 - Passwords must be 8–72 characters (bcrypt ignores bytes beyond 72).
 - Login returns the same error for an unknown email and a wrong password, so the API does not

@@ -90,23 +90,30 @@ model CentreTestOffering {
   @@map("centre_test_offerings")
 }
 
+// Status rules live in src/utils/bookingStatus.ts. Payment data lives in the payments table,
+// which points to the booking (no payment columns here).
 model Booking {
-  id            String             @id @default(uuid()) @db.Uuid
-  userId        String             @map("user_id") @db.Uuid
-  // The offering identifies both the centre and the test.
-  offeringId    String             @map("offering_id") @db.Uuid
-  appointmentAt DateTime           @map("appointment_at") @db.Timestamptz(3)
-  // Snapshot of the offering price at booking time; later price changes must not affect it.
-  amountPaise   Int                @map("amount_paise")
-  status        BookingStatus      @default(PENDING)
-  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
-  user          User               @relation(fields: [userId], references: [id], onDelete: Restrict)
-  offering      CentreTestOffering @relation(fields: [offeringId], references: [id], onDelete: Restrict)
-  payments      Payment[]
+  id                  String             @id @default(uuid()) @db.Uuid
+  userId              String             @map("user_id") @db.Uuid
+  centreId            String             @map("centre_id") @db.Uuid
+  testId              String             @map("test_id") @db.Uuid
+  appointmentDateTime DateTime           @map("appointment_date_time") @db.Timestamptz(3)
+  // Copied from the offering price when the booking is created (never sent by the client),
+  // so later price changes do not affect existing bookings.
+  amountPaise         Int                @map("amount_paise")
+  status              BookingStatus      @default(PENDING)
+  createdAt           DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt           DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  user                User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  // Composite FK to the offering's unique (centre_id, test_id): the database itself guarantees
+  // that the centre really offers the booked test.
+  offering            CentreTestOffering @relation(fields: [centreId, testId], references: [centreId, testId], onDelete: Restrict)
+  payments            Payment[]
 
-  @@index([userId])
-  @@index([offeringId])
+  // A partial unique index in the migration SQL also blocks duplicate active bookings
+  // (same user, centre, test and time while PENDING or CONFIRMED).
+  @@index([userId, createdAt])
+  @@index([centreId, testId])
   @@map("bookings")
 }
 
