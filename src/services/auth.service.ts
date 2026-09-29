@@ -1,9 +1,9 @@
-import { Prisma } from '@prisma/client';
 import { env } from '../config/env';
 import { userRepository } from '../repositories/user.repository';
 import { AppError } from '../utils/AppError';
 import { signAccessToken } from '../utils/jwt';
 import { hashPassword, verifyPassword } from '../utils/password';
+import { isUniqueViolation } from '../utils/prismaErrors';
 import type { LoginInput, SignupInput } from '../validators/auth.validator';
 import type { PublicUser } from '../types/auth';
 
@@ -27,9 +27,7 @@ export const authService = {
     } catch (err) {
       // Two concurrent signups with the same email can both pass the check above;
       // the database unique constraint catches the second one.
-      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-        throw emailTaken();
-      }
+      if (isUniqueViolation(err)) throw emailTaken();
       throw err;
     }
   },

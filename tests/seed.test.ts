@@ -1,5 +1,5 @@
 import request from 'supertest';
-import { seedAdmin } from '../prisma/seed';
+import { seedAdmin, seedCatalogue } from '../prisma/seed';
 import { createApp } from '../src/app';
 import { verifyAccessToken } from '../src/utils/jwt';
 import { prisma, resetDatabase } from './helpers/db';
@@ -43,5 +43,28 @@ describe('seedAdmin', () => {
 
     const stored = await prisma.user.findUniqueOrThrow({ where: { email: adminInput.email } });
     expect(stored.role).toBe('ADMIN');
+  });
+});
+
+describe('seedCatalogue', () => {
+  it('seeds the same test at different prices at different centres', async () => {
+    await seedCatalogue();
+
+    const cbcOfferings = await prisma.centreTestOffering.findMany({
+      where: { test: { name: 'Complete Blood Count (CBC)' } },
+    });
+    const prices = new Set(cbcOfferings.map((o) => o.pricePaise));
+
+    expect(cbcOfferings.length).toBeGreaterThan(1);
+    expect(prices.size).toBe(cbcOfferings.length);
+  });
+
+  it('is safe to run more than once', async () => {
+    const first = await seedCatalogue();
+    await seedCatalogue();
+
+    expect(await prisma.diagnosticCentre.count()).toBe(first.centres);
+    expect(await prisma.diagnosticTest.count()).toBe(first.tests);
+    expect(await prisma.centreTestOffering.count()).toBe(first.offerings);
   });
 });

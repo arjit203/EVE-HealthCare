@@ -41,66 +41,72 @@ model User {
   @@map("users")
 }
 
-model DiagnosticCentre {
-  id        String       @id @default(uuid()) @db.Uuid
-  name      String
-  location  String
-  createdAt DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
-  tests     CentreTest[]
+// No DELETE endpoints exist: every foreign key uses onDelete: Restrict, so a centre, test or
+// offering that bookings refer to can never be removed and booking history stays intact.
 
+model DiagnosticCentre {
+  id        String               @id @default(uuid()) @db.Uuid
+  name      String
+  // Free-text address, e.g. "Koramangala, Bengaluru".
+  location  String
+  createdAt DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+  offerings CentreTestOffering[]
+
+  // The same chain can have branches in different locations, but not two identical entries.
   @@unique([name, location])
   @@map("diagnostic_centres")
 }
 
 // Catalogue of test types (e.g. "Complete Blood Count"), independent of any centre.
 model DiagnosticTest {
-  id          String       @id @default(uuid()) @db.Uuid
-  name        String       @unique
+  id          String               @id @default(uuid()) @db.Uuid
+  name        String               @unique
   description String?
-  createdAt   DateTime     @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt   DateTime     @updatedAt @map("updated_at") @db.Timestamptz(3)
-  centres     CentreTest[]
+  createdAt   DateTime             @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt   DateTime             @updatedAt @map("updated_at") @db.Timestamptz(3)
+  offerings   CentreTestOffering[]
 
   @@map("diagnostic_tests")
 }
 
 // A test offered by a specific centre at a centre-specific price.
-// Prices are stored in minor units (paise) to avoid floating-point rounding.
-model CentreTest {
+// Price is an integer number of paise (49900 = Rs 499.00) to avoid floating-point rounding;
+// a CHECK constraint in the migration SQL keeps it positive.
+model CentreTestOffering {
+  id         String           @id @default(uuid()) @db.Uuid
   centreId   String           @map("centre_id") @db.Uuid
   testId     String           @map("test_id") @db.Uuid
-  priceMinor Int              @map("price_minor")
-  isActive   Boolean          @default(true) @map("is_active")
+  pricePaise Int              @map("price_paise")
   createdAt  DateTime         @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt  DateTime         @updatedAt @map("updated_at") @db.Timestamptz(3)
-  centre     DiagnosticCentre @relation(fields: [centreId], references: [id], onDelete: Cascade)
+  centre     DiagnosticCentre @relation(fields: [centreId], references: [id], onDelete: Restrict)
   test       DiagnosticTest   @relation(fields: [testId], references: [id], onDelete: Restrict)
   bookings   Booking[]
 
-  @@id([centreId, testId])
+  // A centre offers each test at most once.
+  @@unique([centreId, testId])
   @@index([testId])
-  @@map("centre_tests")
+  @@map("centre_test_offerings")
 }
 
 model Booking {
-  id            String        @id @default(uuid()) @db.Uuid
-  userId        String        @map("user_id") @db.Uuid
-  centreId      String        @map("centre_id") @db.Uuid
-  testId        String        @map("test_id") @db.Uuid
-  appointmentAt DateTime      @map("appointment_at") @db.Timestamptz(3)
-  // Snapshot of the price at booking time; later price changes must not affect it.
-  amountMinor   Int           @map("amount_minor")
-  status        BookingStatus @default(PENDING)
-  createdAt     DateTime      @default(now()) @map("created_at") @db.Timestamptz(3)
-  updatedAt     DateTime      @updatedAt @map("updated_at") @db.Timestamptz(3)
-  user          User          @relation(fields: [userId], references: [id], onDelete: Restrict)
-  // Composite FK guarantees the test is actually offered by the chosen centre.
-  centreTest    CentreTest    @relation(fields: [centreId, testId], references: [centreId, testId], onDelete: Restrict)
+  id            String             @id @default(uuid()) @db.Uuid
+  userId        String             @map("user_id") @db.Uuid
+  // The offering identifies both the centre and the test.
+  offeringId    String             @map("offering_id") @db.Uuid
+  appointmentAt DateTime           @map("appointment_at") @db.Timestamptz(3)
+  // Snapshot of the offering price at booking time; later price changes must not affect it.
+  amountPaise   Int                @map("amount_paise")
+  status        BookingStatus      @default(PENDING)
+  createdAt     DateTime           @default(now()) @map("created_at") @db.Timestamptz(3)
+  updatedAt     DateTime           @updatedAt @map("updated_at") @db.Timestamptz(3)
+  user          User               @relation(fields: [userId], references: [id], onDelete: Restrict)
+  offering      CentreTestOffering @relation(fields: [offeringId], references: [id], onDelete: Restrict)
   payments      Payment[]
 
   @@index([userId])
-  @@index([centreId, testId])
+  @@index([offeringId])
   @@map("bookings")
 }
 
@@ -109,7 +115,7 @@ model Booking {
 model Payment {
   id                String         @id @default(uuid()) @db.Uuid
   bookingId         String         @map("booking_id") @db.Uuid
-  amountMinor       Int            @map("amount_minor")
+  amountPaise       Int            @map("amount_paise")
   status            PaymentStatus  @default(PENDING)
   providerReference String         @unique @map("provider_reference")
   createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)

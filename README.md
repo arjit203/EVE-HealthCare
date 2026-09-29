@@ -5,7 +5,7 @@ service and an idempotent payment webhook.
 
 **Stack:** Node.js · Express 5 · TypeScript · PostgreSQL · Prisma · Zod · JWT · Jest + Supertest
 
-> Status: foundation and authentication are implemented. Centres, bookings, payments and the
+> Status: authentication and diagnostic centres/tests are implemented. Bookings, payments and the
 > webhook are implemented in subsequent steps.
 
 ## Running locally
@@ -18,7 +18,7 @@ cp .env.example .env            # then edit DATABASE_URL / secrets
 cp .env.test.example .env.test  # separate database for tests
 
 npm run db:deploy               # apply migrations to the dev database
-npm run db:seed                 # create the admin user from ADMIN_* in .env
+npm run db:seed                 # admin user (from ADMIN_* in .env) + demo centres/tests/prices
 npm run dev                     # http://localhost:3000/health
 ```
 
@@ -111,33 +111,75 @@ curl -X POST http://localhost:3000/auth/login   -H "Content-Type: application/js
 | Expired token                            | 401    | `TOKEN_EXPIRED`            |
 | Normal user calls an admin-only route    | 403    | `FORBIDDEN`                |
 
+### Diagnostic centres & tests
+
+Reads are public. Every write requires an admin token (`authenticate` → 401, `requireAdmin` → 403).
+
+| Method | Path                               | Auth  | Description                                         |
+| ------ | ---------------------------------- | ----- | --------------------------------------------------- |
+| POST   | `/centres`                         | Admin | Create a centre `{ name, location }`                |
+| GET    | `/centres`                         | –     | List centres                                        |
+| GET    | `/centres/:centreId`               | –     | Get one centre                                      |
+| POST   | `/tests`                           | Admin | Create a test `{ name, description? }`              |
+| GET    | `/tests`                           | –     | List the test catalogue                             |
+| POST   | `/centres/:centreId/tests`         | Admin | Offer a test at a centre `{ testId, pricePaise }`   |
+| GET    | `/centres/:centreId/tests`         | –     | Tests offered at a centre, with that centre's price |
+| PATCH  | `/centres/:centreId/tests/:testId` | Admin | Change the price `{ pricePaise }`                   |
+
+Prices are **integers in paise**: `49900` = ₹499.00.
+
+```bash
+# Admin: offer a test at a centre
+curl -X POST http://localhost:3000/centres/<centreId>/tests   -H "Authorization: Bearer <adminToken>" -H "Content-Type: application/json"   -d '{"testId":"<testId>","pricePaise":35000}'
+
+# Public: what does this centre offer, and at what price?
+curl http://localhost:3000/centres/<centreId>/tests
+# 200 { "data": [ { "id": "…", "centreId": "…", "pricePaise": 35000,
+#                   "test": { "id": "…", "name": "Complete Blood Count (CBC)", "description": "…" } } ] }
+```
+
+| Situation                                     | Status | `error.code`       |
+| --------------------------------------------- | ------ | ------------------ |
+| Invalid UUID in the path, bad body, price ≤ 0 | 400    | `VALIDATION_ERROR` |
+| No token on a write                           | 401    | `UNAUTHORIZED`     |
+| Normal user attempts a write                  | 403    | `FORBIDDEN`        |
+| Centre, test or offering not found            | 404    | `NOT_FOUND`        |
+| Duplicate test name, centre, or offering      | 409    | `CONFLICT`         |
+
+There are deliberately **no DELETE endpoints** — see Assumptions.
+
 ## Database design
 
 ```
-users ──< bookings >── centre_tests >── diagnostic_centres
-              │              │
-              │              └──────── diagnostic_tests
-              └──< payments ──< webhook_events
+diagnostic_centres ──< centre_test_offerings >── diagnostic_tests
+                              │
+users ──────────────────< bookings ──< payments ──< webhook_events
 ```
 
-| Table                | Notes                                                                        |
-| -------------------- | ---------------------------------------------------------------------------- |
-| `users`              | Name, unique lowercase email, bcrypt password hash, role (`USER`/`ADMIN`)    |
-| `diagnostic_centres` | Name + location (unique together)                                            |
-| `diagnostic_tests`   | Catalogue of test types, independent of centres                              |
-| `centre_tests`       | Which centre offers which test, and at what price. PK `(centre_id, test_id)` |
-| `bookings`           | User, centre, test, appointment time, amount snapshot, status                |
-| `payments`           | Payment attempts for a booking; unique `provider_reference`                  |
-| `webhook_events`     | Every processed provider event; unique `event_id`                            |
+| Table                   | Notes                                                                                |
+| ----------------------- | ------------------------------------------------------------------------------------ |
+| `users`                 | Name, unique lowercase email, bcrypt password hash, role (`USER`/`ADMIN`)            |
+| `diagnostic_centres`    | Name + free-text location; unique `(name, location)`                                 |
+| `diagnostic_tests`      | Catalogue of test types (unique name, optional description)                          |
+| `centre_test_offerings` | Which centre offers which test, at what `price_paise`; unique `(centre_id, test_id)` |
+| `bookings`              | User, offering (→ centre + test), appointment time, `amount_paise` snapshot, status  |
+| `payments`              | Payment attempts for a booking; unique `provider_reference`                          |
+| `webhook_events`        | Every processed provider event; unique `event_id`                                    |
 
 Key decisions:
 
-- **Money is stored as integers in minor units** (`price_minor`, `amount_minor`, paise) to avoid
-  floating-point rounding. `CHECK (> 0)` constraints guard against zero/negative amounts.
+- **Price belongs to the offering, not the test.** The same test can cost different amounts at
+  different centres (the seed data shows CBC at ₹350, ₹399 and ₹420).
+- **Money is stored as integers in paise** (`price_paise`, `amount_paise`) to avoid
+  floating-point rounding. Zod rejects non-integer or non-positive prices, and hand-written
+  `CHECK (> 0)` constraints in the migration SQL enforce the same rule in the database (Prisma's
+  schema language cannot express CHECK constraints).
 - **Booking amount is a snapshot** of the centre's price at booking time, so later price changes
   do not alter existing bookings.
-- **Composite foreign key** `bookings(centre_id, test_id) → centre_tests` makes it impossible to
-  book a test at a centre that does not offer it.
+- **Bookings reference the offering** (`offering_id`), so a booking can only be for a test the
+  centre actually offers.
+- **All foreign keys are `ON DELETE RESTRICT`**: a centre, test or offering that bookings refer to
+  can never be deleted out from under them.
 - **One booking, many payment attempts** – a failed payment can be retried. A partial unique index
   (`payments_one_success_per_booking`) guarantees at most one `SUCCESS` payment per booking, even
   under concurrent requests.
@@ -155,3 +197,11 @@ Key decisions:
 - A JWT is trusted until it expires (default 1 hour); there are no refresh tokens or revocation.
   The role is stored in the token, so a role change takes effect at the user's next login.
 - There is a single seeded admin; there is no API to promote users.
+- A centre's location is a single free-text string (no structured address or geolocation).
+- Centre uniqueness is `(name, location)`: the same chain may have several branches. Name
+  uniqueness for tests and centres is case-sensitive.
+- Prices are between 1 paise and ₹1,00,000 (`10000000` paise).
+- **No DELETE endpoints.** Once bookings reference an offering, deleting its centre or test would
+  either fail or erase booking history. Removing items from sale would be done with an "active" flag,
+  which is out of scope.
+- Changing a price (PATCH) only affects future bookings; existing bookings keep their snapshot.
