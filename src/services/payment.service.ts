@@ -1,45 +1,22 @@
-import type { PaymentStatus, Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
-import { bookingRepository, type LockedBooking } from '../repositories/booking.repository';
+import { bookingRepository } from '../repositories/booking.repository';
+import { paymentRepository } from '../repositories/payment.repository';
 import { AppError } from '../utils/AppError';
-import { BOOKING_STATUS_FOR_PAYMENT, canTransition } from '../utils/bookingStatus';
+import { canTransition } from '../utils/bookingStatus';
 import { isUniqueViolation } from '../utils/prismaErrors';
 import type { CreatePaymentInput } from '../validators/payment.validator';
 import { mockPaymentProvider } from './mockPaymentProvider';
+import { settlePayment } from './paymentSettlement';
 
 const paymentAlreadyExists = () =>
-  new AppError(409, 'PAYMENT_ALREADY_EXISTS', 'This booking has already been paid for');
-
-/**
- * Records a provider result and moves the booking to CONFIRMED or FAILED, following the booking
- * state machine. Must run inside a transaction that holds the booking's row lock.
- * The payment webhook (module 5) settles through this same function.
- */
-const settlePayment = async (
-  tx: Prisma.TransactionClient,
-  booking: LockedBooking,
-  result: { providerPaymentId: string; status: PaymentStatus },
-) => {
-  const payment = await tx.payment.create({
-    data: {
-      bookingId: booking.id,
-      amountPaise: booking.amountPaise,
-      status: result.status,
-      providerPaymentId: result.providerPaymentId,
-    },
-  });
-
-  const bookingStatus = BOOKING_STATUS_FOR_PAYMENT[result.status];
-  await tx.booking.update({ where: { id: booking.id }, data: { status: bookingStatus } });
-
-  return { ...payment, booking: { id: booking.id, status: bookingStatus } };
-};
+  new AppError(409, 'PAYMENT_ALREADY_EXISTS', 'This booking already has a payment');
 
 export const paymentService = {
   /**
-   * Pays for one of the user's PENDING bookings with the mock provider. Everything happens in one
-   * transaction with the booking row locked, so two concurrent payments (or a payment and a cancel)
-   * cannot both succeed. A FAILED outcome is still a successful request: 201 with status FAILED.
+   * Starts a payment for one of the user's PENDING bookings. Everything happens in one transaction
+   * with the booking row locked, so two concurrent payments (or a payment and a cancel) cannot
+   * interleave. With simulateOutcome the payment is settled immediately; without it, it stays
+   * PENDING until the webhook arrives. A FAILED outcome is still a successful request.
    */
   async pay(userId: string, input: CreatePaymentInput) {
     try {
@@ -47,8 +24,8 @@ export const paymentService = {
         const booking = await bookingRepository.lockForUser(tx, input.bookingId, userId);
         if (!booking) throw AppError.notFound('Booking');
 
-        const target = BOOKING_STATUS_FOR_PAYMENT[input.simulateOutcome];
-        if (!canTransition(booking.status, target)) {
+        // Only a PENDING booking can move to CONFIRMED/FAILED, i.e. be paid.
+        if (!canTransition(booking.status, 'CONFIRMED')) {
           if (booking.status === 'CONFIRMED') throw paymentAlreadyExists();
           throw new AppError(
             409,
@@ -56,6 +33,9 @@ export const paymentService = {
             `A ${booking.status} booking cannot be paid`,
           );
         }
+        // A PENDING booking may already have a PENDING payment waiting for its webhook.
+        if (await paymentRepository.findByBookingId(tx, booking.id)) throw paymentAlreadyExists();
+
         if (booking.appointmentDateTime.getTime() <= Date.now()) {
           throw new AppError(
             409,
@@ -65,12 +45,28 @@ export const paymentService = {
         }
 
         // Instant mock call. A real gateway call would not be made while holding a database lock.
-        const result = mockPaymentProvider.charge({
+        const charge = mockPaymentProvider.charge({
           amountPaise: booking.amountPaise,
           simulateOutcome: input.simulateOutcome,
         });
 
-        return settlePayment(tx, booking, result);
+        const payment = await paymentRepository.create(tx, {
+          bookingId: booking.id,
+          amountPaise: booking.amountPaise,
+          status: 'PENDING',
+          providerPaymentId: charge.providerPaymentId,
+        });
+
+        if (charge.status === 'PENDING') {
+          return { ...payment, booking: { id: booking.id, status: booking.status } };
+        }
+
+        const result = await settlePayment(tx, booking, payment, charge.status);
+        return {
+          ...payment,
+          status: result.paymentStatus,
+          booking: { id: booking.id, status: result.bookingStatus },
+        };
       });
     } catch (err) {
       // Unique booking_id: the database's own guarantee of one payment per booking.

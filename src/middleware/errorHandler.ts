@@ -2,6 +2,7 @@ import type { ErrorRequestHandler, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { ZodError, z } from 'zod';
 import { AppError } from '../utils/AppError';
+import { logger } from '../utils/logger';
 
 const sendError = (
   res: Response,
@@ -40,6 +41,8 @@ export const errorHandler: ErrorRequestHandler = (err, _req, res, _next) => {
     if (err.code === 'P2025') return sendError(res, 404, 'NOT_FOUND', 'Resource not found');
   }
 
-  console.error(err);
+  logger.error('Unhandled error', {
+    error: err instanceof Error ? { name: err.name, message: err.message, stack: err.stack } : err,
+  });
   return sendError(res, 500, 'INTERNAL_SERVER_ERROR', 'Something went wrong');
 };

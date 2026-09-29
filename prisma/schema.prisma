@@ -19,10 +19,22 @@ enum BookingStatus {
   CANCELLED
 }
 
-// Payments are settled immediately by the mock provider, so there is no PENDING payment state.
+// PENDING → SUCCESS or FAILED, once. A payment is either settled immediately by POST /payments
+// (when simulateOutcome is given) or later by the provider's webhook.
 enum PaymentStatus {
+  PENDING
   SUCCESS
   FAILED
+}
+
+// What processing a webhook event did (stored on the event for auditing):
+//   APPLIED          – the event settled a PENDING payment
+//   DUPLICATE_STATE  – the payment was already in the event's status; nothing changed
+//   IGNORED_CONFLICT – the payment was already settled differently; nothing changed
+enum PaymentEventOutcome {
+  APPLIED
+  DUPLICATE_STATE
+  IGNORED_CONFLICT
 }
 
 model User {
@@ -130,22 +142,26 @@ model Payment {
   createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
   booking           Booking        @relation(fields: [bookingId], references: [id], onDelete: Restrict)
-  webhookEvents     WebhookEvent[]
+  events            PaymentEvent[]
 
   @@map("payments")
 }
 
-// Every webhook delivery is recorded by its provider event ID.
-// The unique constraint on event_id is what makes webhook processing idempotent.
-model WebhookEvent {
-  id         String        @id @default(uuid()) @db.Uuid
-  eventId    String        @unique @map("event_id")
-  paymentId  String        @map("payment_id") @db.Uuid
-  status     PaymentStatus
-  payload    Json
-  receivedAt DateTime      @default(now()) @map("received_at") @db.Timestamptz(3)
-  payment    Payment       @relation(fields: [paymentId], references: [id], onDelete: Restrict)
+// One row per webhook event received from the payment provider. The UNIQUE provider_event_id is
+// the database-level idempotency guarantee: the same event can never be recorded (or applied) twice.
+// The event row and the payment/booking update are written in the same transaction.
+model PaymentEvent {
+  id              String              @id @default(uuid()) @db.Uuid
+  providerEventId String              @unique @map("provider_event_id")
+  paymentId       String              @map("payment_id") @db.Uuid
+  // SUCCESS or FAILED only (CHECK constraint in the migration SQL).
+  status          PaymentStatus
+  outcome         PaymentEventOutcome
+  // The event exactly as received, for auditing and debugging.
+  payload         Json
+  receivedAt      DateTime            @default(now()) @map("received_at") @db.Timestamptz(3)
+  payment         Payment             @relation(fields: [paymentId], references: [id], onDelete: Restrict)
 
   @@index([paymentId])
-  @@map("webhook_events")
+  @@map("payment_events")
 }

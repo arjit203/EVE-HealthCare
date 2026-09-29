@@ -1,4 +1,4 @@
-import type { BookingStatus, Prisma } from '@prisma/client';
+import { Prisma, type BookingStatus } from '@prisma/client';
 import { prisma } from '../config/prisma';
 
 // Every booking is returned with the centre and test it is for, and its payment (if any).
@@ -69,12 +69,25 @@ export const bookingRepository = {
    * transaction ends. Any other transaction that wants to change this booking (a second payment, a
    * cancel) waits, then sees the updated status. Returns null if not found or not the user's.
    */
-  async lockForUser(tx: Prisma.TransactionClient, id: string, userId: string) {
-    const rows = await tx.$queryRaw<LockedBooking[]>`
-      SELECT id, status, amount_paise AS "amountPaise", appointment_date_time AS "appointmentDateTime"
-      FROM bookings
-      WHERE id = ${id}::uuid AND user_id = ${userId}::uuid
-      FOR UPDATE`;
-    return rows[0] ?? null;
+  lockForUser(tx: Prisma.TransactionClient, id: string, userId: string) {
+    return lockWhere(tx, Prisma.sql`id = ${id}::uuid AND user_id = ${userId}::uuid`);
+  },
+
+  /** Same lock without the owner filter, for system callers such as the payment webhook. */
+  lockById(tx: Prisma.TransactionClient, id: string) {
+    return lockWhere(tx, Prisma.sql`id = ${id}::uuid`);
+  },
+
+  updateStatus(tx: Prisma.TransactionClient, id: string, status: BookingStatus) {
+    return tx.booking.update({ where: { id }, data: { status } });
   },
 };
+
+async function lockWhere(tx: Prisma.TransactionClient, condition: Prisma.Sql) {
+  const rows = await tx.$queryRaw<LockedBooking[]>`
+    SELECT id, status, amount_paise AS "amountPaise", appointment_date_time AS "appointmentDateTime"
+    FROM bookings
+    WHERE ${condition}
+    FOR UPDATE`;
+  return rows[0] ?? null;
+}

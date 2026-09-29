@@ -5,8 +5,8 @@ service and an idempotent payment webhook.
 
 **Stack:** Node.js · Express 5 · TypeScript · PostgreSQL · Prisma · Zod · JWT · Jest + Supertest
 
-> Status: authentication, diagnostic centres/tests, bookings and simulated payments are implemented.
-> The payment webhook is implemented in a subsequent step.
+> Status: all assignment modules are implemented — authentication, diagnostic centres/tests,
+> bookings, simulated payments and the idempotent payment webhook.
 
 ## Running locally
 
@@ -94,10 +94,14 @@ the request body is ignored); the only admin is created by `npm run db:seed`. Ad
 `authenticate` (who are you? → 401) followed by `requireAdmin` (are you allowed? → 403).
 
 ```bash
-curl -X POST http://localhost:3000/auth/signup   -H "Content-Type: application/json"   -d '{"name":"Asha Rao","email":"asha@example.com","password":"password123"}'
+curl -X POST http://localhost:3000/auth/signup \
+  -H "Content-Type: application/json" \
+  -d '{"name":"Asha Rao","email":"asha@example.com","password":"password123"}'
 # 201 { "data": { "id": "…", "name": "Asha Rao", "email": "asha@example.com", "createdAt": "…" } }
 
-curl -X POST http://localhost:3000/auth/login   -H "Content-Type: application/json"   -d '{"email":"asha@example.com","password":"password123"}'
+curl -X POST http://localhost:3000/auth/login \
+  -H "Content-Type: application/json" \
+  -d '{"email":"asha@example.com","password":"password123"}'
 # 200 { "data": { "accessToken": "eyJ…", "tokenType": "Bearer", "expiresIn": "1h", "user": { … } } }
 ```
 
@@ -130,7 +134,9 @@ Prices are **integers in paise**: `49900` = ₹499.00.
 
 ```bash
 # Admin: offer a test at a centre
-curl -X POST http://localhost:3000/centres/<centreId>/tests   -H "Authorization: Bearer <adminToken>" -H "Content-Type: application/json"   -d '{"testId":"<testId>","pricePaise":35000}'
+curl -X POST http://localhost:3000/centres/<centreId>/tests \
+  -H "Authorization: Bearer <adminToken>" -H "Content-Type: application/json" \
+  -d '{"testId":"<testId>","pricePaise":35000}'
 
 # Public: what does this centre offer, and at what price?
 curl http://localhost:3000/centres/<centreId>/tests
@@ -161,7 +167,9 @@ All booking routes require a token. Every user — including admins — only eve
 | PATCH  | `/bookings/:id/cancel` | Cancel one of the caller's bookings              |
 
 ```bash
-curl -X POST http://localhost:3000/bookings   -H "Authorization: Bearer <token>" -H "Content-Type: application/json"   -d '{"centreId":"<centreId>","testId":"<testId>","appointmentDateTime":"2030-01-15T10:00:00+05:30"}'
+curl -X POST http://localhost:3000/bookings \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"centreId":"<centreId>","testId":"<testId>","appointmentDateTime":"2030-01-15T10:00:00+05:30"}'
 # 201 { "data": { "id": "…", "status": "PENDING", "amountPaise": 35000,
 #                 "appointmentDateTime": "2030-01-15T04:30:00.000Z",
 #                 "centre": { "id": "…", "name": "HealthFirst Diagnostics", "location": "…" },
@@ -198,56 +206,125 @@ Booking responses include the booking's `payment` (`id`, `status`, `providerPaym
 
 ### Payments (simulated)
 
-There is **no real payment gateway**. A mock provider settles the payment immediately.
+There is **no real payment gateway**. A mock provider stands in for one.
 
-| Method | Path        | Auth | Description                                                            |
-| ------ | ----------- | ---- | ---------------------------------------------------------------------- |
-| POST   | `/payments` | User | Pay for one of your PENDING bookings `{ bookingId, simulateOutcome? }` |
+| Method | Path                 | Auth           | Description                                                            |
+| ------ | -------------------- | -------------- | ---------------------------------------------------------------------- |
+| POST   | `/payments`          | User           | Pay for one of your PENDING bookings `{ bookingId, simulateOutcome? }` |
+| POST   | `/payments/webhook/` | Webhook secret | Provider notifies the payment outcome (see next section)               |
+
+A payment can be settled in two ways, and **both go through one shared function**
+(`settlePayment()` in `src/services/paymentSettlement.ts`):
+
+1. **Immediately** — send `simulateOutcome: "SUCCESS" | "FAILED"`. The mock settles the payment in
+   the same request → `201`.
+2. **Later, via the webhook** — omit `simulateOutcome`. The payment is created `PENDING`, the booking
+   stays `PENDING`, and the response is `202 Accepted`. The provider's webhook settles it.
 
 ```bash
-curl -X POST http://localhost:3000/payments   -H "Authorization: Bearer <token>" -H "Content-Type: application/json"   -d '{"bookingId":"<bookingId>","simulateOutcome":"SUCCESS"}'
-# 201 { "data": { "id": "…", "bookingId": "…", "amountPaise": 35000, "status": "SUCCESS",
-#                 "providerPaymentId": "mock_pay_…", "booking": { "id": "…", "status": "CONFIRMED" } } }
+# Settle via the webhook (like a real gateway)
+curl -X POST http://localhost:3000/payments \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"bookingId":"<bookingId>"}'
+# 202 { "data": { "id": "…", "amountPaise": 35000, "status": "PENDING",
+#                 "providerPaymentId": "mock_pay_…", "booking": { "id": "…", "status": "PENDING" } } }
+
+# Or settle immediately
+curl -X POST http://localhost:3000/payments \
+  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
+  -d '{"bookingId":"<bookingId>","simulateOutcome":"SUCCESS"}'
+# 201 { "data": { …, "status": "SUCCESS", "booking": { "id": "…", "status": "CONFIRMED" } } }
 ```
 
-- `simulateOutcome` (`"SUCCESS"` | `"FAILED"`, default `"SUCCESS"`) makes the mock deterministic
-  for testing. Letting the client pick the outcome is acceptable **only because this is a mock**; with a
-  real gateway the outcome comes from the provider.
+- Letting the client choose the outcome is acceptable **only because this is a mock** (it makes the
+  behaviour deterministic for testing). With a real gateway the provider decides.
 - The amount is always the booking's `amountPaise`. Sending `amount` is rejected with 400.
 - **A failed payment is still a successful request**: `201` with `"status": "FAILED"`, and the
   booking becomes `FAILED`. 4xx codes are reserved for requests that could not be processed.
-- Flow: SUCCESS → booking `CONFIRMED`; FAILED → booking `FAILED` (terminal: the user creates a new
-  booking to try again).
-- **Relationship with the webhook:** `POST /payments` settles synchronously. The webhook
-  (`POST /payments/webhook/`) is the provider's asynchronous notification of the same outcome; both
-  settle through one shared function, so a webhook for an already-settled payment changes nothing.
+- SUCCESS → booking `CONFIRMED`; FAILED → booking `FAILED` (terminal: the user books again).
 
 | Situation                                               | Status | `error.code`             |
 | ------------------------------------------------------- | ------ | ------------------------ |
 | Missing/malformed `bookingId`, unknown field (`amount`) | 400    | `VALIDATION_ERROR`       |
 | No token                                                | 401    | `UNAUTHORIZED`           |
 | Booking doesn't exist or belongs to another user        | 404    | `NOT_FOUND`              |
-| Booking already paid (CONFIRMED)                        | 409    | `PAYMENT_ALREADY_EXISTS` |
+| Booking already has a payment (PENDING or CONFIRMED)    | 409    | `PAYMENT_ALREADY_EXISTS` |
 | Booking is FAILED or CANCELLED                          | 409    | `BOOKING_NOT_PAYABLE`    |
 | Appointment time has passed                             | 409    | `APPOINTMENT_PASSED`     |
+
+### Payment webhook
+
+`POST /payments/webhook/` is called by the payment provider, not by users. It requires the header
+`X-Webhook-Secret: <WEBHOOK_SECRET>` (compared in constant time with `crypto.timingSafeEqual`);
+without it anyone could "confirm" any booking.
+
+```bash
+curl -X POST http://localhost:3000/payments/webhook/ \
+  -H "X-Webhook-Secret: <WEBHOOK_SECRET>" -H "Content-Type: application/json" \
+  -d '{"eventId":"evt_123","providerPaymentId":"mock_pay_…","status":"SUCCESS","amount":35000}'
+# 200 { "data": { "eventId": "evt_123", "providerPaymentId": "mock_pay_…",
+#                 "status": "SUCCESS", "outcome": "APPLIED" } }
+```
+
+The payload is strict: `eventId`, `providerPaymentId` (the provider's own reference — it doesn't know
+our booking IDs), `status` (`SUCCESS` | `FAILED`) and `amount` (paise). **The webhook never creates
+payments or bookings; it only updates an existing payment and its booking.**
+
+**Idempotency works at two levels:**
+
+1. **Same event delivered again** (same `eventId`): `payment_events.provider_event_id` is UNIQUE, so
+   the event can never be recorded or applied twice. The stored result is returned (identical `200`
+   response every time). If the same `eventId` arrives with a _different_ body, the first delivery
+   counts: the stored result is returned and a warning is logged.
+2. **Same outcome under a new event ID** (the provider re-sends): the event is recorded, but
+   `settlePayment()` sees the payment is already in that status and changes nothing →
+   `outcome: "DUPLICATE_STATE"`.
+
+Every event is stored with what happened to it (`outcome`):
+
+| Situation                                     | Result                                                                                                                                    | `outcome`          |
+| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| PENDING payment + SUCCESS / FAILED            | Payment settled; booking → CONFIRMED / FAILED                                                                                             | `APPLIED`          |
+| Payment already in the reported status        | Nothing changes                                                                                                                           | `DUPLICATE_STATE`  |
+| Payment SUCCESS, then a FAILED event          | Keeps SUCCESS; warning logged                                                                                                             | `IGNORED_CONFLICT` |
+| Payment FAILED, then a SUCCESS event          | Keeps FAILED (terminal); logged as `MANUAL_RECONCILIATION_REQUIRED` — in a real system money was taken, so a human must refund or confirm | `IGNORED_CONFLICT` |
+| Booking CANCELLED while pending, then SUCCESS | Payment → SUCCESS, booking **stays CANCELLED**; logged as `REFUND_REQUIRED`                                                               | `APPLIED`          |
+
+| Situation                                  | Status | Why                                                                   |
+| ------------------------------------------ | ------ | --------------------------------------------------------------------- |
+| Applied, duplicate or conflict             | 200    | An error would make the provider retry an event that will never apply |
+| Invalid payload or status (e.g. `PENDING`) | 400    | `VALIDATION_ERROR`                                                    |
+| Missing or wrong secret                    | 401    | `INVALID_WEBHOOK_SECRET`                                              |
+| Unknown `providerPaymentId`                | 404    | `NOT_FOUND`                                                           |
+| `amount` doesn't match the payment         | 422    | `AMOUNT_MISMATCH` — nothing recorded or applied                       |
+
+An unknown **event ID** is not an error — it simply means the event is new.
+
+**Retry handling without retry infrastructure.** Recording the event and applying its effect happen
+in **one database transaction**. If processing fails halfway (crash, DB error), both are rolled
+back and the provider — which retries until it gets a 2xx — redelivers the event, which is then
+processed cleanly. If the event row were committed separately, a crash before the update would make
+every retry look like a duplicate and the payment would never settle. (A test simulates exactly
+this crash.)
 
 ## Database design
 
 ```
 diagnostic_centres ──< centre_test_offerings >── diagnostic_tests
                               │
-users ──────────────────< bookings ──< payments ──< webhook_events
+users ──────────────────< bookings ──── payments ──< payment_events
+                                    (1 : 0..1)
 ```
 
-| Table                   | Notes                                                                                           |
-| ----------------------- | ----------------------------------------------------------------------------------------------- |
-| `users`                 | Name, unique lowercase email, bcrypt password hash, role (`USER`/`ADMIN`)                       |
-| `diagnostic_centres`    | Name + free-text location; unique `(name, location)`                                            |
-| `diagnostic_tests`      | Catalogue of test types (unique name, optional description)                                     |
-| `centre_test_offerings` | Which centre offers which test, at what `price_paise`; unique `(centre_id, test_id)`            |
-| `bookings`              | User, centre, test, `appointment_date_time`, `amount_paise` snapshot, status enum               |
-| `payments`              | One per booking (unique `booking_id`); amount, `SUCCESS`/`FAILED`, unique `provider_payment_id` |
-| `webhook_events`        | Every processed provider event; unique `event_id`                                               |
+| Table                   | Notes                                                                                                     |
+| ----------------------- | --------------------------------------------------------------------------------------------------------- |
+| `users`                 | Name, unique lowercase email, bcrypt password hash, role (`USER`/`ADMIN`)                                 |
+| `diagnostic_centres`    | Name + free-text location; unique `(name, location)`                                                      |
+| `diagnostic_tests`      | Catalogue of test types (unique name, optional description)                                               |
+| `centre_test_offerings` | Which centre offers which test, at what `price_paise`; unique `(centre_id, test_id)`                      |
+| `bookings`              | User, centre, test, `appointment_date_time`, `amount_paise` snapshot, status enum                         |
+| `payments`              | One per booking (unique `booking_id`); amount, `PENDING`/`SUCCESS`/`FAILED`, unique `provider_payment_id` |
+| `payment_events`        | One row per provider event: unique `provider_event_id`, status, `outcome`, raw JSON `payload`             |
 
 Key decisions:
 
@@ -272,34 +349,15 @@ Key decisions:
   can never be deleted out from under them.
 - **One payment per booking** (unique `payments.booking_id`). Because FAILED bookings are terminal,
   a booking is never paid twice, and the database itself blocks double payment.
-- **Payment is one transaction with a row lock.** `POST /payments` locks the booking
-  (`SELECT … FOR UPDATE`), checks it is PENDING, creates the payment and updates the booking before
-  committing. A concurrent second payment (or a cancel) waits for the lock and then sees the new
-  status, so exactly one wins.
-- **Webhook idempotency** – `webhook_events.event_id` is unique. The event row is inserted in the
-  same transaction as the payment/booking update, so a replayed event either hits the unique
-  constraint or finds the payment already in a terminal state, and becomes a no-op.
+- **Row locking.** `POST /payments` and the webhook both lock the booking row
+  (`SELECT … FOR UPDATE`) inside their transaction, in the same order, and re-read the payment after
+  taking the lock. Concurrent payments, cancels and webhook deliveries for the same booking are
+  therefore serialised: exactly one wins, the others see its result.
+- **Webhook idempotency is enforced by the database**: unique `payment_events.provider_event_id`,
+  written in the same transaction as the state change.
 
 ## Assumptions
 
-- Timestamps are stored as `timestamptz`. `appointmentDateTime` must be ISO 8601 **with a
-  timezone** (`Z` or `+05:30`) and in the future; responses are in UTC.
-- There is no slot/capacity management: any future time is bookable.
-- Admins have no special access to bookings; they see only their own.
-- A booking cannot be cancelled after its appointment time. Cancelling a CONFIRMED booking does not
-  trigger a refund (refunds are out of scope).
-- If a payment succeeds for a booking that is already CANCELLED, the payment is recorded but the
-  booking stays CANCELLED, and the event is logged.
-- All amounts are in Indian rupees (paise); there is no currency column.
-- Payment retries on the same booking are not supported: after a failed payment the booking is
-  FAILED and the user books again.
-
-## What I would improve with more time
-
-- An `Idempotency-Key` header on `POST /payments`, so a client retrying after a network timeout gets
-  the original payment back instead of a 409.
-- A real gateway integration would create a PENDING payment first and call the provider **outside**
-  the database transaction (never hold a row lock during a network call), then settle on the webhook.
 - Emails are case-insensitive: they are trimmed and lowercased before being stored or looked up.
 - Passwords must be 8–72 characters (bcrypt ignores bytes beyond 72).
 - Login returns the same error for an unknown email and a wrong password, so the API does not
@@ -315,3 +373,26 @@ Key decisions:
   either fail or erase booking history. Removing items from sale would be done with an "active" flag,
   which is out of scope.
 - Changing a price (PATCH) only affects future bookings; existing bookings keep their snapshot.
+- Timestamps are stored as `timestamptz`. `appointmentDateTime` must be ISO 8601 **with a
+  timezone** (`Z` or `+05:30`) and in the future; responses are in UTC.
+- There is no slot/capacity management: any future time is bookable.
+- Admins have no special access to bookings; they see only their own.
+- A booking cannot be cancelled after its appointment time. Cancelling a CONFIRMED booking does not
+  trigger a refund (refunds are out of scope).
+- All amounts are in Indian rupees (paise); there is no currency column.
+- Payment retries on the same booking are not supported: after a failed payment the booking is
+  FAILED and the user books again.
+- Refunds and manual reconciliation are out of scope; the cases that would need them are logged
+  (`REFUND_REQUIRED`, `MANUAL_RECONCILIATION_REQUIRED`).
+- The webhook is authenticated with a shared secret header. Real providers usually sign the raw body
+  with HMAC instead (see improvements).
+
+## What I would improve with more time
+
+- **HMAC-signed webhooks**: verify a signature over the raw request body (as Razorpay/Stripe do)
+  instead of a static shared secret, plus a timestamp to reject replayed old requests.
+- An `Idempotency-Key` header on `POST /payments`, so a client retrying after a network timeout gets
+  the original payment back instead of a 409.
+- A real gateway integration would call the provider **outside** the database transaction (never hold
+  a row lock during a network call) and rely on the webhook to settle.
+- A reconciliation job/report for `REFUND_REQUIRED` and `MANUAL_RECONCILIATION_REQUIRED` cases.

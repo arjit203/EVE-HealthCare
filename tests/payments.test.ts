@@ -69,13 +69,29 @@ describe('POST /payments — successful payment', () => {
     expect(await bookingStatus(booking.id)).toBe('CONFIRMED');
   });
 
-  it('defaults to SUCCESS when simulateOutcome is omitted', async () => {
+  it('without simulateOutcome: returns 202 with a PENDING payment and leaves the booking PENDING', async () => {
     const booking = await createBooking();
 
     const res = await pay({ bookingId: booking.id });
 
-    expect(res.status).toBe(201);
-    expect(res.body.data.status).toBe('SUCCESS');
+    expect(res.status).toBe(202);
+    expect(res.body.data).toMatchObject({
+      status: 'PENDING',
+      amountPaise: 35000,
+      booking: { id: booking.id, status: 'PENDING' },
+    });
+    expect(await bookingStatus(booking.id)).toBe('PENDING');
+  });
+
+  it('returns 409 when paying again while a PENDING payment awaits its webhook', async () => {
+    const booking = await createBooking();
+    await pay({ bookingId: booking.id });
+
+    const res = await pay({ bookingId: booking.id, simulateOutcome: 'SUCCESS' });
+
+    expect(res.status).toBe(409);
+    expect(res.body.error.code).toBe('PAYMENT_ALREADY_EXISTS');
+    expect(await prisma.payment.count()).toBe(1);
   });
 
   it('charges the booking amount, even if the price changed after booking', async () => {
@@ -85,7 +101,7 @@ describe('POST /payments — successful payment', () => {
       .set('Authorization', adminAuth)
       .send({ pricePaise: 99900 });
 
-    const res = await pay({ bookingId: booking.id });
+    const res = await pay({ bookingId: booking.id, simulateOutcome: 'SUCCESS' });
 
     expect(res.body.data.amountPaise).toBe(booking.amountPaise);
     expect(res.body.data.amountPaise).toBe(35000);
@@ -93,7 +109,7 @@ describe('POST /payments — successful payment', () => {
 
   it('shows the payment on GET /bookings/:id', async () => {
     const booking = await createBooking();
-    const payment = (await pay({ bookingId: booking.id })).body.data;
+    const payment = (await pay({ bookingId: booking.id, simulateOutcome: 'SUCCESS' })).body.data;
 
     const res = await request(app).get(`/bookings/${booking.id}`).set('Authorization', alice);
 
@@ -224,8 +240,8 @@ describe('POST /payments — concurrency', () => {
     const booking = await createBooking();
 
     const results = await Promise.all([
-      pay({ bookingId: booking.id }),
-      pay({ bookingId: booking.id }),
+      pay({ bookingId: booking.id, simulateOutcome: 'SUCCESS' }),
+      pay({ bookingId: booking.id, simulateOutcome: 'SUCCESS' }),
     ]);
 
     expect(results.map((r) => r.status).sort()).toEqual([201, 409]);
@@ -250,7 +266,7 @@ describe('POST /payments — concurrency', () => {
     const booking = await createBooking();
 
     const [payRes, cancelRes] = await Promise.all([
-      pay({ bookingId: booking.id }),
+      pay({ bookingId: booking.id, simulateOutcome: 'SUCCESS' }),
       request(app).patch(`/bookings/${booking.id}/cancel`).set('Authorization', alice),
     ]);
 

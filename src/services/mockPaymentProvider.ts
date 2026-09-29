@@ -3,14 +3,15 @@ import type { PaymentStatus } from '@prisma/client';
 
 /**
  * Stand-in for a real payment gateway. No money moves and no card/UPI details exist.
- * The outcome is chosen by the caller (default SUCCESS) so that behaviour is deterministic and
- * testable; a real gateway would decide the outcome itself.
+ * With simulateOutcome the result is immediate and deterministic (for testing); without it the
+ * payment stays PENDING and the outcome arrives later through the webhook, as with a real gateway.
  */
 export const mockPaymentProvider = {
-  charge(input: { amountPaise: number; simulateOutcome: PaymentStatus }) {
+  charge(input: { amountPaise: number; simulateOutcome?: 'SUCCESS' | 'FAILED' }) {
+    const status: PaymentStatus = input.simulateOutcome ?? 'PENDING';
     return {
       providerPaymentId: `mock_pay_${randomUUID()}`,
-      status: input.simulateOutcome,
+      status,
       amountPaise: input.amountPaise,
     };
   },
