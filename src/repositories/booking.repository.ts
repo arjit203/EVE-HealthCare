@@ -1,7 +1,7 @@
-import type { BookingStatus } from '@prisma/client';
+import type { BookingStatus, Prisma } from '@prisma/client';
 import { prisma } from '../config/prisma';
 
-// Every booking is returned with the centre and test it is for.
+// Every booking is returned with the centre and test it is for, and its payment (if any).
 const withCentreAndTest = {
   offering: {
     select: {
@@ -9,7 +9,17 @@ const withCentreAndTest = {
       test: { select: { id: true, name: true } },
     },
   },
+  payment: {
+    select: { id: true, status: true, providerPaymentId: true, amountPaise: true, createdAt: true },
+  },
 } as const;
+
+export interface LockedBooking {
+  id: string;
+  status: BookingStatus;
+  amountPaise: number;
+  appointmentDateTime: Date;
+}
 
 export const bookingRepository = {
   create(data: {
@@ -52,5 +62,19 @@ export const bookingRepository = {
       data: { status: to },
     });
     return count;
+  },
+
+  /**
+   * Inside a transaction: reads the user's booking and LOCKS its row (SELECT … FOR UPDATE) until the
+   * transaction ends. Any other transaction that wants to change this booking (a second payment, a
+   * cancel) waits, then sees the updated status. Returns null if not found or not the user's.
+   */
+  async lockForUser(tx: Prisma.TransactionClient, id: string, userId: string) {
+    const rows = await tx.$queryRaw<LockedBooking[]>`
+      SELECT id, status, amount_paise AS "amountPaise", appointment_date_time AS "appointmentDateTime"
+      FROM bookings
+      WHERE id = ${id}::uuid AND user_id = ${userId}::uuid
+      FOR UPDATE`;
+    return rows[0] ?? null;
   },
 };

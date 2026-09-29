@@ -1,4 +1,4 @@
-import type { BookingStatus } from '@prisma/client';
+import type { BookingStatus, PaymentStatus } from '@prisma/client';
 
 /**
  * The single definition of which booking status changes are allowed.
@@ -25,3 +25,9 @@ export const canTransition = (from: BookingStatus, to: BookingStatus) =>
 /** Every status that is allowed to move to `to`. Used in conditional (atomic) updates. */
 export const statusesThatCanBecome = (to: BookingStatus): BookingStatus[] =>
   (Object.keys(ALLOWED_TRANSITIONS) as BookingStatus[]).filter((from) => canTransition(from, to));
+
+/** The booking status a payment outcome moves a PENDING booking to. */
+export const BOOKING_STATUS_FOR_PAYMENT: Record<PaymentStatus, BookingStatus> = {
+  SUCCESS: 'CONFIRMED',
+  FAILED: 'FAILED',
+};

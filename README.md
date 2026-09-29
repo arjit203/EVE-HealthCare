@@ -5,8 +5,8 @@ service and an idempotent payment webhook.
 
 **Stack:** Node.js · Express 5 · TypeScript · PostgreSQL · Prisma · Zod · JWT · Jest + Supertest
 
-> Status: authentication, diagnostic centres/tests and bookings are implemented. Payments and the
-> webhook are implemented in subsequent steps.
+> Status: authentication, diagnostic centres/tests, bookings and simulated payments are implemented.
+> The payment webhook is implemented in a subsequent step.
 
 ## Running locally
 
@@ -193,6 +193,44 @@ PENDING ──payment succeeds──► CONFIRMED ──user cancels──► CA
 Another user's booking returns **404, not 403**, so the API never reveals that a booking ID exists.
 This is enforced in the query itself (`WHERE id = ? AND user_id = ?`), not by fetching and comparing.
 
+Booking responses include the booking's `payment` (`id`, `status`, `providerPaymentId`,
+`amountPaise`) once it has been paid, or `null`.
+
+### Payments (simulated)
+
+There is **no real payment gateway**. A mock provider settles the payment immediately.
+
+| Method | Path        | Auth | Description                                                            |
+| ------ | ----------- | ---- | ---------------------------------------------------------------------- |
+| POST   | `/payments` | User | Pay for one of your PENDING bookings `{ bookingId, simulateOutcome? }` |
+
+```bash
+curl -X POST http://localhost:3000/payments   -H "Authorization: Bearer <token>" -H "Content-Type: application/json"   -d '{"bookingId":"<bookingId>","simulateOutcome":"SUCCESS"}'
+# 201 { "data": { "id": "…", "bookingId": "…", "amountPaise": 35000, "status": "SUCCESS",
+#                 "providerPaymentId": "mock_pay_…", "booking": { "id": "…", "status": "CONFIRMED" } } }
+```
+
+- `simulateOutcome` (`"SUCCESS"` | `"FAILED"`, default `"SUCCESS"`) makes the mock deterministic
+  for testing. Letting the client pick the outcome is acceptable **only because this is a mock**; with a
+  real gateway the outcome comes from the provider.
+- The amount is always the booking's `amountPaise`. Sending `amount` is rejected with 400.
+- **A failed payment is still a successful request**: `201` with `"status": "FAILED"`, and the
+  booking becomes `FAILED`. 4xx codes are reserved for requests that could not be processed.
+- Flow: SUCCESS → booking `CONFIRMED`; FAILED → booking `FAILED` (terminal: the user creates a new
+  booking to try again).
+- **Relationship with the webhook:** `POST /payments` settles synchronously. The webhook
+  (`POST /payments/webhook/`) is the provider's asynchronous notification of the same outcome; both
+  settle through one shared function, so a webhook for an already-settled payment changes nothing.
+
+| Situation                                               | Status | `error.code`             |
+| ------------------------------------------------------- | ------ | ------------------------ |
+| Missing/malformed `bookingId`, unknown field (`amount`) | 400    | `VALIDATION_ERROR`       |
+| No token                                                | 401    | `UNAUTHORIZED`           |
+| Booking doesn't exist or belongs to another user        | 404    | `NOT_FOUND`              |
+| Booking already paid (CONFIRMED)                        | 409    | `PAYMENT_ALREADY_EXISTS` |
+| Booking is FAILED or CANCELLED                          | 409    | `BOOKING_NOT_PAYABLE`    |
+| Appointment time has passed                             | 409    | `APPOINTMENT_PASSED`     |
+
 ## Database design
 
 ```
@@ -201,15 +239,15 @@ diagnostic_centres ──< centre_test_offerings >── diagnostic_tests
 users ──────────────────< bookings ──< payments ──< webhook_events
 ```
 
-| Table                   | Notes                                                                                |
-| ----------------------- | ------------------------------------------------------------------------------------ |
-| `users`                 | Name, unique lowercase email, bcrypt password hash, role (`USER`/`ADMIN`)            |
-| `diagnostic_centres`    | Name + free-text location; unique `(name, location)`                                 |
-| `diagnostic_tests`      | Catalogue of test types (unique name, optional description)                          |
-| `centre_test_offerings` | Which centre offers which test, at what `price_paise`; unique `(centre_id, test_id)` |
-| `bookings`              | User, centre, test, `appointment_date_time`, `amount_paise` snapshot, status enum    |
-| `payments`              | Payment attempts for a booking; unique `provider_reference`                          |
-| `webhook_events`        | Every processed provider event; unique `event_id`                                    |
+| Table                   | Notes                                                                                           |
+| ----------------------- | ----------------------------------------------------------------------------------------------- |
+| `users`                 | Name, unique lowercase email, bcrypt password hash, role (`USER`/`ADMIN`)                       |
+| `diagnostic_centres`    | Name + free-text location; unique `(name, location)`                                            |
+| `diagnostic_tests`      | Catalogue of test types (unique name, optional description)                                     |
+| `centre_test_offerings` | Which centre offers which test, at what `price_paise`; unique `(centre_id, test_id)`            |
+| `bookings`              | User, centre, test, `appointment_date_time`, `amount_paise` snapshot, status enum               |
+| `payments`              | One per booking (unique `booking_id`); amount, `SUCCESS`/`FAILED`, unique `provider_payment_id` |
+| `webhook_events`        | Every processed provider event; unique `event_id`                                               |
 
 Key decisions:
 
@@ -229,12 +267,15 @@ Key decisions:
   A cancelled or failed slot can be booked again.
 - **Cancellation is atomic**: a single conditional `UPDATE … WHERE id AND user_id AND status IN
 (PENDING, CONFIRMED) AND appointment in the future`, so it cannot race with a payment update.
-- **No payment columns on `bookings`.** Payments point to the booking (one booking, many attempts).
+- **No payment columns on `bookings`.** The payment row points to the booking.
 - **All foreign keys are `ON DELETE RESTRICT`**: a centre, test or offering that bookings refer to
   can never be deleted out from under them.
-- **One booking, many payment attempts** – a failed payment can be retried. A partial unique index
-  (`payments_one_success_per_booking`) guarantees at most one `SUCCESS` payment per booking, even
-  under concurrent requests.
+- **One payment per booking** (unique `payments.booking_id`). Because FAILED bookings are terminal,
+  a booking is never paid twice, and the database itself blocks double payment.
+- **Payment is one transaction with a row lock.** `POST /payments` locks the booking
+  (`SELECT … FOR UPDATE`), checks it is PENDING, creates the payment and updates the booking before
+  committing. A concurrent second payment (or a cancel) waits for the lock and then sees the new
+  status, so exactly one wins.
 - **Webhook idempotency** – `webhook_events.event_id` is unique. The event row is inserted in the
   same transaction as the payment/booking update, so a replayed event either hits the unique
   constraint or finds the payment already in a terminal state, and becomes a no-op.
@@ -249,6 +290,16 @@ Key decisions:
   trigger a refund (refunds are out of scope).
 - If a payment succeeds for a booking that is already CANCELLED, the payment is recorded but the
   booking stays CANCELLED, and the event is logged.
+- All amounts are in Indian rupees (paise); there is no currency column.
+- Payment retries on the same booking are not supported: after a failed payment the booking is
+  FAILED and the user books again.
+
+## What I would improve with more time
+
+- An `Idempotency-Key` header on `POST /payments`, so a client retrying after a network timeout gets
+  the original payment back instead of a 409.
+- A real gateway integration would create a PENDING payment first and call the provider **outside**
+  the database transaction (never hold a row lock during a network call), then settle on the webhook.
 - Emails are case-insensitive: they are trimmed and lowercased before being stored or looked up.
 - Passwords must be 8–72 characters (bcrypt ignores bytes beyond 72).
 - Login returns the same error for an unknown email and a wrong password, so the API does not

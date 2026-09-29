@@ -19,8 +19,8 @@ enum BookingStatus {
   CANCELLED
 }
 
+// Payments are settled immediately by the mock provider, so there is no PENDING payment state.
 enum PaymentStatus {
-  PENDING
   SUCCESS
   FAILED
 }
@@ -108,7 +108,7 @@ model Booking {
   // Composite FK to the offering's unique (centre_id, test_id): the database itself guarantees
   // that the centre really offers the booked test.
   offering            CentreTestOffering @relation(fields: [centreId, testId], references: [centreId, testId], onDelete: Restrict)
-  payments            Payment[]
+  payment             Payment?
 
   // A partial unique index in the migration SQL also blocks duplicate active bookings
   // (same user, centre, test and time while PENDING or CONFIRMED).
@@ -117,20 +117,21 @@ model Booking {
   @@map("bookings")
 }
 
-// A booking can have several payment attempts (e.g. retry after a failure),
-// but at most one SUCCESS (enforced by a partial unique index in the migration).
+// One payment per booking (unique booking_id). FAILED bookings are terminal, so a failed payment
+// is never retried on the same booking; the database itself therefore blocks double payment.
 model Payment {
   id                String         @id @default(uuid()) @db.Uuid
-  bookingId         String         @map("booking_id") @db.Uuid
+  bookingId         String         @unique @map("booking_id") @db.Uuid
+  // Copied from the booking inside the payment transaction; never taken from the request.
   amountPaise       Int            @map("amount_paise")
-  status            PaymentStatus  @default(PENDING)
-  providerReference String         @unique @map("provider_reference")
+  status            PaymentStatus
+  // The mock provider's reference (e.g. "mock_pay_<uuid>"); webhooks identify payments by it.
+  providerPaymentId String         @unique @map("provider_payment_id")
   createdAt         DateTime       @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt         DateTime       @updatedAt @map("updated_at") @db.Timestamptz(3)
   booking           Booking        @relation(fields: [bookingId], references: [id], onDelete: Restrict)
   webhookEvents     WebhookEvent[]
 
-  @@index([bookingId])
   @@map("payments")
 }
 
