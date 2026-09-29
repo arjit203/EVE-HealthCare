@@ -7,8 +7,8 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum UserRole {
-  PATIENT
+enum Role {
+  USER
   ADMIN
 }
 
@@ -28,9 +28,12 @@ enum PaymentStatus {
 model User {
   id           String    @id @default(uuid()) @db.Uuid
   name         String
+  // Normalised to lowercase before saving, so uniqueness is case-insensitive.
   email        String    @unique
+  // bcrypt hash; the plaintext password is never stored.
   passwordHash String    @map("password_hash")
-  role         UserRole  @default(PATIENT)
+  // Signup always creates USER; ADMIN accounts are only created by the seed script.
+  role         Role      @default(USER)
   createdAt    DateTime  @default(now()) @map("created_at") @db.Timestamptz(3)
   updatedAt    DateTime  @updatedAt @map("updated_at") @db.Timestamptz(3)
   bookings     Booking[]

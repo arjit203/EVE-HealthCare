@@ -4,3 +4,6 @@ coverage/
 .env
 .env.test
 *.log
+
+# Personal learning notes (not part of the submission)
+learning/
