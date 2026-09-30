@@ -1,5 +1,5 @@
 /**
- * Module 5 — Payment webhook (POST /payments/webhook/): settlement, idempotency, conflicts,
+ * Payment webhook (POST /payments/webhook/): settlement, idempotency, conflicts,
  * atomicity and rejection. The webhook only updates existing payments; it never creates any.
  */
 import request from 'supertest';

@@ -1,5 +1,5 @@
 /**
- * Module 0 — Foundation: app wiring, the central error handler and environment validation.
+ * Foundation: app wiring, the central error handler and environment validation.
  * No database needed.
  */
 import express from 'express';

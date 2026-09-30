@@ -1,5 +1,5 @@
 /**
- * Module 2 — Diagnostic centres, tests and offerings (a test offered by a centre at a price).
+ * Diagnostic centres, tests and offerings (a test offered by a centre at a price).
  * Creation goes through the API here, because creating these is what is under test.
  */
 import request from 'supertest';

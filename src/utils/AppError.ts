@@ -13,10 +13,6 @@ export class AppError extends Error {
     this.name = 'AppError';
   }
 
-  static badRequest(message: string, details?: unknown) {
-    return new AppError(400, 'BAD_REQUEST', message, details);
-  }
-
   static unauthorized(message = 'Authentication required') {
     return new AppError(401, 'UNAUTHORIZED', message);
   }

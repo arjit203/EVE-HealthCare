@@ -1,5 +1,5 @@
 /**
- * Module 4 — Simulated payments (POST /payments): outcomes, amount integrity, ownership,
+ * Simulated payments (POST /payments): outcomes, amount integrity, ownership,
  * booking-state rules and concurrency.
  */
 import request from 'supertest';

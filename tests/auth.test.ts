@@ -1,5 +1,5 @@
 /**
- * Module 1 — Authentication & authorization: signup, login, JWT middleware, admin check.
+ * Authentication & authorization: signup, login, JWT middleware, admin check.
  */
 import express from 'express';
 import jwt from 'jsonwebtoken';

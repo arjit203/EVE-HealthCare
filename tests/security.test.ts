@@ -1,5 +1,5 @@
 /**
- * Module 6 — Security sweep: sensitive data never appears in any API response.
+ * Security sweep: sensitive data never appears in any API response.
  * (Per-endpoint security cases — ownership, roles, secrets, JWT — live in each module's file.)
  */
 import request from 'supertest';

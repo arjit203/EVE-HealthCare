@@ -1,5 +1,5 @@
 /**
- * Module 3 — Bookings: creation rules, ownership, cancellation and the booking state machine.
+ * Bookings: creation rules, ownership, cancellation and the booking state machine.
  */
 import request from 'supertest';
 import { createApp } from '../src/app';

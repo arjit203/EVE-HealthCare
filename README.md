@@ -112,7 +112,10 @@ appointment_date_time) WHERE status IN ('PENDING','CONFIRMED')` blocks double-cl
 a cancelled or failed slot can be booked again.
 
 The CHECK constraints and partial index are hand-written SQL in the migrations (Prisma's schema
-language can't express them); `prisma migrate dev` was verified not to drop them.
+language can't express them); `prisma migrate dev` was verified not to drop them. The six
+migrations reflect iterative development (e.g. the centre–test join table gained its own id, and
+payments moved to one-per-booking); they were always applied to empty tables, and applying them in
+order to an empty database produces exactly the schema described here.
 
 ### Transaction boundaries
 
@@ -260,9 +263,9 @@ paid or cancelled after its appointment time.
 A payment is settled in one of two ways — both go through the same `settlePayment()` function:
 
 ```
-Synchronous:   POST /payments {bookingId, simulateOutcome: SUCCESS|FAILED}  → 201, booking CONFIRMED|FAILED
-Asynchronous:  POST /payments {bookingId}                                   → 202, payment PENDING, booking PENDING
-               POST /payments/webhook/ {eventId, providerPaymentId, status} → 200, booking CONFIRMED|FAILED
+Synchronous:   POST /payments {bookingId, simulateOutcome: SUCCESS|FAILED}          → 201, booking CONFIRMED|FAILED
+Asynchronous:  POST /payments {bookingId}                                           → 202, payment PENDING, booking PENDING
+               POST /payments/webhook/ {eventId, providerPaymentId, status, amount} → 200, booking CONFIRMED|FAILED
 ```
 
 `POST /payments` locks the booking row (`SELECT … FOR UPDATE`) and checks it's the caller's,
@@ -443,6 +446,8 @@ waits — races are tested with `Promise.all`.
   test, centre and time.
 - **Webhooks:** conflicts are recorded and logged, never applied (table in section 8). For the same
   event ID with a different body, the first delivery counts. Authentication is a shared secret header.
+  The webhook body schema is strict (unknown fields → 400) because the provider is mocked; a real
+  integration would accept unknown fields, since rejecting them would make the provider retry forever.
 - **Money** is INR in integer paise, from 1 paise to ₹1,00,000 per offering; no currency column.
 - **Time:** stored as `timestamptz`; `appointmentDateTime` must be ISO 8601 **with a timezone** and
   in the future; responses are in UTC. There is no slot or capacity management.
