@@ -1,10 +1,13 @@
+/**
+ * Module 6 — Security sweep: sensitive data never appears in any API response.
+ * (Per-endpoint security cases — ownership, roles, secrets, JWT — live in each module's file.)
+ */
 import request from 'supertest';
 import { createApp } from '../src/app';
-import { createUserWithToken } from './helpers/auth';
 import { prisma, resetDatabase } from './helpers/db';
+import { createUser, nextAppointment, payFor } from './helpers/factories';
 
 const app = createApp();
-const DAY = 24 * 60 * 60 * 1000;
 
 // The hash field (camelCase or snake_case), any bcrypt hash, or a password value used below echoed
 // back. (The word "password" alone is fine: validation errors legitimately name the field.)
@@ -20,7 +23,7 @@ it('no response anywhere in the main flow contains a password or password hash',
     return res;
   };
 
-  const admin = (await createUserWithToken('ADMIN')).auth;
+  const admin = (await createUser('ADMIN')).auth;
   record(
     await request(app)
       .post('/auth/signup')
@@ -55,18 +58,9 @@ it('no response anywhere in the main flow contains a password or password hash',
     await request(app)
       .post('/bookings')
       .set('Authorization', user)
-      .send({
-        centreId: centre.id,
-        testId: test.id,
-        appointmentDateTime: new Date(Date.now() + 7 * DAY).toISOString(),
-      }),
+      .send({ centreId: centre.id, testId: test.id, appointmentDateTime: nextAppointment() }),
   ).body.data;
-  record(
-    await request(app)
-      .post('/payments')
-      .set('Authorization', user)
-      .send({ bookingId: booking.id, simulateOutcome: 'SUCCESS' }),
-  );
+  record(await payFor(user, booking.id, 'SUCCESS'));
   record(await request(app).get('/bookings').set('Authorization', user));
   record(await request(app).get(`/bookings/${booking.id}`).set('Authorization', user));
   // Error responses too.

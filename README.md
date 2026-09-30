@@ -26,13 +26,47 @@ npm run dev                     # http://localhost:3000/health
 
 ```bash
 npm run db:test:deploy          # apply migrations to the test database
-npm test                        # 185 tests (unit + API integration against PostgreSQL)
+npm test                        # 186 tests (unit + API integration against PostgreSQL)
 npm test -- --coverage          # ~95% statements, ~85% branches
 ```
 
-Test files run one at a time (`maxWorkers: 1`) because they share one test database, which is
-emptied before each test. Concurrency is tested explicitly (`Promise.all`): double payment,
-payment vs cancel, and duplicate webhook deliveries.
+Jest + Supertest against a real PostgreSQL test database — no mocks of the database, no test
+containers, fixture libraries or snapshots. One file per module:
+
+| File                 | Covers                                                                  |
+| -------------------- | ----------------------------------------------------------------------- |
+| `foundation.test.ts` | Health, JSON 404, malformed/oversized bodies, error handler, env checks |
+| `auth.test.ts`       | Signup, login, JWT middleware, admin check                              |
+| `catalogue.test.ts`  | Centres, tests, offerings and prices                                    |
+| `bookings.test.ts`   | Booking rules, ownership, cancellation, the booking state machine       |
+| `payments.test.ts`   | Simulated payments, amount integrity, concurrency                       |
+| `webhook.test.ts`    | Webhook settlement, idempotency, conflicts, atomicity, rejection        |
+| `security.test.ts`   | No password or hash in any response                                     |
+| `seed.test.ts`       | The seed script                                                         |
+
+Each test creates its own data with small factories (`tests/helpers/factories.ts`: `createUser`,
+`createCentreWithTest`, `createBookingFor`, `payFor`, `sendWebhook`) — nothing depends on seed
+data. The database is emptied before every test and files run one at a time (`--runInBand`), since
+they share one database. Dates are relative to "now" (always in the future), and there are no
+timing-based waits: races are tested with `Promise.all`, and where timing alone can't reliably hit
+a race branch, one repository call is stubbed to open the race window deterministically.
+
+### What the tests prove
+
+| Guarantee                                                               | Proven by (file › test)                                                                                                                                                                                                             |
+| ----------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Webhook idempotency** — the same event applied once                   | `webhook` › _webhook idempotency — the same event E1 delivered twice_                                                                                                                                                               |
+| …even when delivered concurrently                                       | `webhook` › _the same event sent 5 times concurrently is applied exactly once_                                                                                                                                                      |
+| …and when a new event ID repeats an outcome                             | `webhook` › _is recorded as DUPLICATE_STATE and changes nothing_                                                                                                                                                                    |
+| **Webhook atomicity** — a crash never leaves an event half-applied      | `webhook` › _a crash after settling but before saving the event rolls both back…_                                                                                                                                                   |
+| **No invalid state changes** from late/conflicting events               | `webhook` › _conflicting events_ (3 tests); `bookings` › _booking state machine_                                                                                                                                                    |
+| **No double payment**                                                   | `payments` › _lets exactly one of two simultaneous payments succeed_                                                                                                                                                                |
+| **Amount integrity** — clients can't set prices; bookings keep theirs   | `bookings` › _returns 400 for a client-supplied amount…_, _keeps the booked amount when an admin later changes the price_; `payments` › _charges the booking amount…_; `webhook` › _returns 422 for an amount that does not match…_ |
+| **Ownership** — users can't see, cancel or pay others' bookings         | `bookings` › _returns 404 (not 403) when fetching another user's booking_, _…cancelling another user's booking_; `payments` › _returns 404 when paying for another user's booking_                                                  |
+| **Authorization** — only admins manage the catalogue; no self-promotion | `catalogue` › _returns 403 for a normal user…_; `auth` › _ignores a role in the request body…_                                                                                                                                      |
+| **Only offered tests are bookable** (service + composite FK)            | `bookings` › _returns 422 when the centre does not offer the test_, _is refused by the database…_                                                                                                                                   |
+| **Webhook authenticity**                                                | `webhook` › _returns 401 for a missing/wrong secret_                                                                                                                                                                                |
+| **No sensitive data leaks**                                             | `security` › _no response … contains a password or password hash_; `foundation` › _error handler_                                                                                                                                   |
 
 ### Other scripts
 
