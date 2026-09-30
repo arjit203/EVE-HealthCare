@@ -7,3 +7,6 @@ coverage/
 
 # Personal learning notes (not part of the submission)
 learning/
+
+# Local AI-assistant settings (never part of the repository)
+.claude/

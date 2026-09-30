@@ -9,6 +9,7 @@
     "node": ">=20"
   },
   "scripts": {
+    "postinstall": "prisma generate",
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
@@ -18,7 +19,7 @@
     "format": "prettier --write .",
     "db:migrate": "prisma migrate dev",
     "db:deploy": "prisma migrate deploy",
-    "db:test:deploy": "dotenv -e .env.test -- prisma migrate deploy",
+    "db:test:deploy": "node node_modules/dotenv-cli/cli.js -e .env.test -o -- prisma migrate deploy",
     "db:generate": "prisma generate",
     "db:seed": "prisma db seed"
   },

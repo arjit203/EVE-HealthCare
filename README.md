@@ -1,55 +1,414 @@
-# EVE Healthcare – Diagnostic Booking Service
+# EVE Healthcare — Diagnostic Booking Service
 
-A small backend for booking diagnostic tests at diagnostic centres, with a simulated payment
-service and an idempotent payment webhook.
+A backend for booking diagnostic tests at diagnostic centres, with a **simulated payment service**
+and an **idempotent payment webhook**. Built for the EVE Healthcare SDE Intern backend assignment.
 
-**Stack:** Node.js · Express 5 · TypeScript · PostgreSQL · Prisma · Zod · JWT · Jest + Supertest
+**Contents:** [Overview](#1-project-overview) · [Tech stack](#2-tech-stack) ·
+[Architecture](#3-architecture) · [Database](#4-database-design) · [Auth](#5-authentication--authorization) ·
+[API](#6-api-endpoints) · [Booking flow](#7-booking--payment-flow) ·
+[Webhook idempotency](#8-webhook-idempotency) · [Edge cases](#9-edge-cases) ·
+[Local setup](#10-local-setup) · [Assumptions](#11-assumptions) · [Improvements](#12-what-i-would-improve-with-more-time)
 
-> Status: all assignment modules are implemented — authentication, diagnostic centres/tests,
-> bookings, simulated payments and the idempotent payment webhook.
+---
 
-## Running locally
+## 1. Project overview
 
-Prerequisites: Node.js 20+ and a running PostgreSQL instance.
+- Users **sign up and log in** (JWT). An admin **manages diagnostic centres, tests and prices**.
+- The same test can have a **different price at each centre** (a test _offering_).
+- Users **book** a test at a centre for a future time. The booking starts **PENDING** and its amount
+  is taken from the centre's price — never from the client.
+- Users **pay** through a **mock payment provider** (no real gateway). The outcome is applied
+  immediately or later by the provider's **webhook**, and the booking becomes **CONFIRMED** or
+  **FAILED**.
+- The webhook is **idempotent**: repeated or conflicting provider events can never duplicate
+  payments or corrupt booking state.
+
+## 2. Tech stack
+
+| Area          | Choice                                                   | Why                                                                      |
+| ------------- | -------------------------------------------------------- | ------------------------------------------------------------------------ |
+| Runtime / API | Node.js, **Express 5**, **TypeScript**                   | Express 5 forwards async errors to the error handler natively            |
+| Database      | **PostgreSQL** + **Prisma** ORM                          | Relational data, transactions, constraints; typed queries and migrations |
+| Auth          | **JWT** (`jsonwebtoken`, HS256), **bcrypt** (`bcryptjs`) | Stateless auth; salted, slow password hashing                            |
+| Validation    | **Zod**                                                  | Strict request schemas with typed output                                 |
+| Tests         | **Jest** + **Supertest**                                 | API integration tests against a real test database                       |
+
+`package.json` / `package-lock.json` serve as the requirements file (the Node.js equivalent of
+`requirements.txt`). No Docker is used.
+
+## 3. Architecture
+
+```
+Client ─► Express route ─► middleware ─► controller ─► service ─► repository ─► PostgreSQL
+                          (authenticate,                (business   (Prisma
+                           requireAdmin,                 rules)      queries)
+                           verifyWebhookSecret,
+                           validate)
+          Any error thrown at any step ─► errorHandler ─► consistent JSON error
+```
+
+| Layer (`src/`)  | Responsibility                                                                                                                                                                        |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `routes/`       | Map URLs to controllers and attach middleware per route (e.g. admin-only writes)                                                                                                      |
+| `middleware/`   | `authenticate` (JWT → `req.user`), `requireAdmin`, `verifyWebhookSecret`, `validate` (Zod), `errorHandler`, `notFound`                                                                |
+| `validators/`   | Zod schemas for bodies and URL params                                                                                                                                                 |
+| `controllers/`  | HTTP only: read the validated request, call a service, choose the status code                                                                                                         |
+| `services/`     | Business rules: pricing, ownership, the booking state machine, payment settlement, webhook idempotency. Services that need atomicity open the transaction and pass it to repositories |
+| `repositories/` | All Prisma queries (the only layer that queries the database)                                                                                                                         |
+| `utils/`        | `AppError`, JWT and password helpers, `bookingStatus` (state machine), structured JSON `logger`                                                                                       |
+| `config/`       | Environment validation (the app refuses to start on bad config) and the Prisma client                                                                                                 |
+
+`createApp()` (`app.ts`) is separate from `server.ts`, so tests exercise the app without opening a port.
+
+## 4. Database design
+
+```mermaid
+erDiagram
+    users ||--o{ bookings : makes
+    diagnostic_centres ||--o{ centre_test_offerings : offers
+    diagnostic_tests ||--o{ centre_test_offerings : "offered as"
+    centre_test_offerings ||--o{ bookings : "booked via (centre_id, test_id)"
+    bookings ||--o| payments : "paid by"
+    payments ||--o{ payment_events : "provider events"
+```
+
+| Table                   | Key columns and constraints                                                                                                                                                                                      |
+| ----------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `users`                 | name, **unique** lowercase email, bcrypt `password_hash`, `role` enum `USER`/`ADMIN` (default `USER`)                                                                                                            |
+| `diagnostic_centres`    | name, free-text `location`; **unique (name, location)**                                                                                                                                                          |
+| `diagnostic_tests`      | **unique** name, optional description                                                                                                                                                                            |
+| `centre_test_offerings` | `centre_id`, `test_id`, `price_paise`; **unique (centre_id, test_id)**; **CHECK price_paise > 0**                                                                                                                |
+| `bookings`              | `user_id`, `centre_id`, `test_id`, `appointment_date_time` (timestamptz), `amount_paise` (CHECK > 0), status enum; **composite FK (centre_id, test_id) → offering**; **partial unique index** on active bookings |
+| `payments`              | **unique `booking_id`** (one per booking), `amount_paise` (CHECK > 0), status `PENDING`/`SUCCESS`/`FAILED`, **unique `provider_payment_id`**                                                                     |
+| `payment_events`        | **unique `provider_event_id`**, `payment_id`, status (CHECK SUCCESS/FAILED), `outcome`, raw JSON `payload`                                                                                                       |
+
+All foreign keys are `ON DELETE RESTRICT`: nothing that bookings depend on can be deleted.
+
+**Why `centre_test_offerings` instead of test IDs on the centre?** Centres and tests are
+many-to-many, and the **price belongs to the pair**, not to the test (the seed data has CBC at ₹350,
+₹399 and ₹420 at three centres). A join table lets the database enforce what a JSON list of IDs
+couldn't: foreign keys (the test must exist), uniqueness (no duplicate offering), a positive-price
+CHECK, and bookings that reference an offering.
+
+**How the booking amount is determined.** `POST /bookings` looks up the offering for the chosen
+centre and test and copies its `price_paise` into `bookings.amount_paise`. The client cannot send an
+amount (strict schema → 400). This is a **snapshot**: a later price change doesn't affect existing
+bookings. Money is stored as **integer paise** (`35000` = ₹350.00) to avoid floating-point errors.
+
+**Only offered tests can be booked.** The service returns 422 if the centre doesn't offer the
+test, and the **composite foreign key** `bookings(centre_id, test_id) → centre_test_offerings`
+guarantees it at the database level too.
+
+**Payment → Booking.** Each payment points to one booking, and `payments.booking_id` is **unique**:
+a booking has at most one payment. Because a FAILED booking is terminal (the user books again),
+a booking is never paid twice — the database itself blocks double payment. There are no payment
+columns on `bookings`.
+
+**Payment events.** Every webhook event is stored in `payment_events`; its unique
+`provider_event_id` is the database-level idempotency guarantee (section 8).
+
+**Duplicate bookings.** A partial unique index on `(user_id, centre_id, test_id,
+appointment_date_time) WHERE status IN ('PENDING','CONFIRMED')` blocks double-clicked duplicates, while
+a cancelled or failed slot can be booked again.
+
+The CHECK constraints and partial index are hand-written SQL in the migrations (Prisma's schema
+language can't express them); `prisma migrate dev` was verified not to drop them.
+
+### Transaction boundaries
+
+| Operation                                  | Mechanism                                                         | Why                                                   |
+| ------------------------------------------ | ----------------------------------------------------------------- | ----------------------------------------------------- |
+| Payment (`POST /payments`)                 | Interactive transaction + `SELECT … FOR UPDATE` on the booking    | Several reads and two writes depend on current status |
+| Webhook processing                         | Transaction + booking row lock; event row in the same transaction | An event can never be recorded without its effect     |
+| Cancellation                               | One conditional `UPDATE … WHERE status IN (…)`                    | A single statement is already atomic                  |
+| Signup, catalogue writes, booking creation | Single `INSERT`, guarded by unique constraints / FKs              | One statement; no multi-step invariant                |
+
+## 5. Authentication & authorization
+
+- **Signup** `POST /auth/signup` — email is trimmed and lowercased (so `A@x.com` and `a@x.com`
+  are the same account); password 8 characters to **72 bytes** (bcrypt's limit), hashed with
+  bcrypt (cost 10). **Signup always creates a `USER`**: a `role` field in the body is ignored.
+- **Login** `POST /auth/login` — returns a JWT (HS256, 1 hour, claims `sub`, `email`, `role`).
+  Unknown email and wrong password return the **same** 401 and take similar time (a dummy bcrypt
+  comparison), so emails can't be enumerated.
+- **Protected endpoints** need `Authorization: Bearer <token>`. `authenticate` verifies signature,
+  expiry and algorithm (pinned to HS256) and sets `req.user` from the token — no database lookup.
+- **Admin role.** Creating/editing centres, tests and prices requires `authenticate` +
+  `requireAdmin` (401 without a token, 403 for a normal user). The role is read from the token.
+  The only admin is created by the **seed script** from `ADMIN_*` environment variables.
+- **Ownership.** Booking queries always filter by the user from the token, so another user's
+  booking returns **404** (not 403) — its existence is never revealed. Admins see only their own
+  bookings too.
+- **Webhook** requests are authenticated by an `X-Webhook-Secret` header (constant-time comparison),
+  not a JWT.
+
+## 6. API endpoints
+
+| Method | Endpoint                           | Auth           | Purpose                                                        |
+| ------ | ---------------------------------- | -------------- | -------------------------------------------------------------- |
+| GET    | `/health`                          | –              | Liveness check                                                 |
+| POST   | `/auth/signup`                     | –              | Register (always `USER`)                                       |
+| POST   | `/auth/login`                      | –              | Get a JWT                                                      |
+| GET    | `/centres`                         | –              | List centres                                                   |
+| GET    | `/centres/:centreId`               | –              | One centre                                                     |
+| POST   | `/centres`                         | Admin          | Create a centre `{ name, location }`                           |
+| GET    | `/tests`                           | –              | List the test catalogue                                        |
+| POST   | `/tests`                           | Admin          | Create a test `{ name, description? }`                         |
+| GET    | `/centres/:centreId/tests`         | –              | Tests offered at a centre, with that centre's price            |
+| POST   | `/centres/:centreId/tests`         | Admin          | Offer a test at a centre `{ testId, pricePaise }`              |
+| PATCH  | `/centres/:centreId/tests/:testId` | Admin          | Change the price `{ pricePaise }`                              |
+| POST   | `/bookings`                        | User           | Book `{ centreId, testId, appointmentDateTime }`               |
+| GET    | `/bookings`                        | User           | Your bookings, newest first (with payment)                     |
+| GET    | `/bookings/:id`                    | User           | One of your bookings                                           |
+| PATCH  | `/bookings/:id/cancel`             | User           | Cancel one of your bookings                                    |
+| POST   | `/payments`                        | User           | Pay for your PENDING booking `{ bookingId, simulateOutcome? }` |
+| POST   | `/payments/webhook/`               | Webhook secret | Provider reports a payment outcome                             |
+
+### Response format and status codes
+
+Success: `{ "data": … }`. Every error has the same shape:
+
+```json
+{ "error": { "code": "VALIDATION_ERROR", "message": "Request validation failed", "details": { … } } }
+```
+
+| Status | Meaning                                                                                  |
+| ------ | ---------------------------------------------------------------------------------------- |
+| 200    | OK — including a webhook that was applied, a duplicate, or a conflict                    |
+| 201    | Created — including a payment whose outcome is `FAILED`                                  |
+| 202    | Accepted — payment created `PENDING`, awaiting the webhook                               |
+| 400    | Invalid payload, malformed JSON or malformed UUID                                        |
+| 401    | Missing, invalid or expired JWT; missing or wrong webhook secret                         |
+| 403    | Authenticated, but not an admin, on an admin-only write                                  |
+| 404    | Not found — **or owned by another user**                                                 |
+| 409    | Duplicate record, or a state that doesn't allow the action                               |
+| 413    | Request body larger than 100 kb                                                          |
+| 415    | Unsupported request body encoding                                                        |
+| 422    | Well-formed but invalid combination: test not offered at centre; webhook amount mismatch |
+| 500    | Unexpected error (generic message; details only in the server log)                       |
+
+### Example requests
+
+Responses below were captured from the built server (`npm start`) on a freshly seeded database;
+IDs and tokens are shortened with `…`.
 
 ```bash
-npm install
-cp .env.example .env            # then edit DATABASE_URL / secrets
-cp .env.test.example .env.test  # separate database for tests
+# Sign up, then log in
+curl -X POST http://localhost:3000/auth/signup -H "Content-Type: application/json" \
+  -d '{"name":"Asha Rao","email":"asha@example.com","password":"password123"}'
+# 201 {"data":{"id":"ed142df0-…","name":"Asha Rao","email":"asha@example.com","role":"USER","createdAt":"2026-09-30T05:46:13.966Z"}}
 
-npm run db:deploy               # apply migrations to the dev database
-npm run db:seed                 # admin user (from ADMIN_* in .env) + demo centres/tests/prices
-npm run dev                     # http://localhost:3000/health
+curl -X POST http://localhost:3000/auth/login -H "Content-Type: application/json" \
+  -d '{"email":"asha@example.com","password":"password123"}'
+# 200 {"data":{"accessToken":"eyJhbGciOiJIUzI1NiIs…","tokenType":"Bearer","expiresIn":"1h","user":{…,"role":"USER"}}}
+
+# Tests offered at a centre, with that centre's price (abbreviated to the first entry)
+curl http://localhost:3000/centres/<centreId>/tests
+# 200 {"data":[{"id":"cd08e11a-…","centreId":"74ff0be3-…","testId":"3e8948d8-…","pricePaise":35000,
+#       "test":{"id":"3e8948d8-…","name":"Complete Blood Count (CBC)","description":"Measures red cells, white cells and platelets."}}, …]}
+
+# Admin creates a centre (a normal user's token gets 403 FORBIDDEN "Admin access required")
+curl -X POST http://localhost:3000/centres -H "Authorization: Bearer <adminToken>" \
+  -H "Content-Type: application/json" -d '{"name":"Wellness Labs","location":"Salt Lake, Kolkata"}'
+# 201 {"data":{"id":"885f681e-…","name":"Wellness Labs","location":"Salt Lake, Kolkata",…}}
+
+# Book a test (the amount comes from the centre's price; the time is returned in UTC)
+curl -X POST http://localhost:3000/bookings -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" \
+  -d '{"centreId":"<centreId>","testId":"<testId>","appointmentDateTime":"2031-01-15T10:30:00+05:30"}'
+# 201 {"data":{"id":"bfc75421-…","appointmentDateTime":"2031-01-15T05:00:00.000Z","amountPaise":35000,
+#       "status":"PENDING","payment":null,"centre":{"name":"HealthFirst Diagnostics",…},"test":{"name":"Complete Blood Count (CBC)",…},…}}
+# Same request with "amount":1 → 400 VALIDATION_ERROR (Unrecognized key: "amount")
+# A test the centre doesn't offer → 422 {"error":{"code":"TEST_NOT_OFFERED","message":"This centre does not offer the selected test"}}
+
+# Pay; without simulateOutcome the payment waits for the webhook
+curl -X POST http://localhost:3000/payments -H "Authorization: Bearer <token>" \
+  -H "Content-Type: application/json" -d '{"bookingId":"<bookingId>"}'
+# 202 {"data":{"id":"215a2e5b-…","bookingId":"bfc75421-…","amountPaise":35000,"status":"PENDING",
+#       "providerPaymentId":"mock_pay_4dde13e7-…","booking":{"id":"bfc75421-…","status":"PENDING"}}}
+# With "simulateOutcome":"FAILED" → 201 {"data":{…,"status":"FAILED","booking":{…,"status":"FAILED"}}}
+
+# The provider's webhook settles it (sending the same event again returns the identical response)
+curl -X POST http://localhost:3000/payments/webhook/ -H "X-Webhook-Secret: <WEBHOOK_SECRET>" \
+  -H "Content-Type: application/json" \
+  -d '{"eventId":"evt_1001","providerPaymentId":"mock_pay_4dde13e7-…","status":"SUCCESS","amount":35000}'
+# 200 {"data":{"eventId":"evt_1001","providerPaymentId":"mock_pay_4dde13e7-…","status":"SUCCESS","outcome":"APPLIED"}}
+# Without the header → 401 {"error":{"code":"INVALID_WEBHOOK_SECRET","message":"Missing or invalid webhook secret"}}
+
+curl http://localhost:3000/bookings/<bookingId> -H "Authorization: Bearer <token>"
+# 200 {"data":{"id":"bfc75421-…","amountPaise":35000,"status":"CONFIRMED",
+#       "payment":{"id":"215a2e5b-…","status":"SUCCESS","providerPaymentId":"mock_pay_4dde13e7-…","amountPaise":35000,…},…}}
 ```
+
+## 7. Booking & payment flow
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING : POST /bookings
+    PENDING --> CONFIRMED : payment SUCCESS
+    PENDING --> FAILED : payment FAILED
+    PENDING --> CANCELLED : user cancels
+    CONFIRMED --> CANCELLED : user cancels (no refund)
+    FAILED --> [*]
+    CANCELLED --> [*]
+```
+
+The allowed transitions are defined once (`src/utils/bookingStatus.ts`) and reused by
+cancellation, payments and the webhook. **FAILED and CANCELLED are terminal**; a booking can't be
+paid or cancelled after its appointment time.
+
+A payment is settled in one of two ways — both go through the same `settlePayment()` function:
+
+```
+Synchronous:   POST /payments {bookingId, simulateOutcome: SUCCESS|FAILED}  → 201, booking CONFIRMED|FAILED
+Asynchronous:  POST /payments {bookingId}                                   → 202, payment PENDING, booking PENDING
+               POST /payments/webhook/ {eventId, providerPaymentId, status} → 200, booking CONFIRMED|FAILED
+```
+
+`POST /payments` locks the booking row (`SELECT … FOR UPDATE`) and checks it's the caller's,
+PENDING, not already paid and not in the past, all in one transaction. Two simultaneous payments —
+or a payment and a cancel — are serialised: exactly one wins (tested with `Promise.all`).
+
+## 8. Webhook idempotency
+
+**Why duplicates happen.** Payment providers deliver webhooks _at least once_: they retry until
+they receive a 2xx, so timeouts, slow responses or their own retry logic can deliver the **same
+event several times** — possibly at the same moment — and events can arrive out of order.
+
+**Idempotency works at two levels:**
+
+1. **Same event delivered again** — every event carries a provider `eventId`, stored as
+   `payment_events.provider_event_id` with a **UNIQUE** constraint. A repeat is recognised and the
+   **stored result is returned** (identical `200` body every time). If two copies race, the database
+   accepts only one insert; the other's transaction rolls back and it replies with the committed
+   result. If the same `eventId` arrives with a _different_ body, the first delivery counts; the
+   difference is logged.
+2. **Same outcome under a new event ID** — the event is recorded, but `settlePayment()` sees the
+   payment is already in that status and changes nothing (`outcome: DUPLICATE_STATE`).
+
+**Late or conflicting events never corrupt state.** A payment moves `PENDING → SUCCESS | FAILED`
+exactly once:
+
+| Situation                                     | Result                                                                                                                                 | `outcome`          |
+| --------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
+| PENDING payment + SUCCESS / FAILED            | Payment settled; booking → CONFIRMED / FAILED                                                                                          | `APPLIED`          |
+| Payment already in the reported status        | Nothing changes                                                                                                                        | `DUPLICATE_STATE`  |
+| Payment SUCCESS, then FAILED                  | Keeps SUCCESS; warning logged                                                                                                          | `IGNORED_CONFLICT` |
+| Payment FAILED, then SUCCESS                  | Keeps FAILED (terminal); logged `MANUAL_RECONCILIATION_REQUIRED` — in a real system money was taken, so a human must refund or confirm | `IGNORED_CONFLICT` |
+| Booking CANCELLED while pending, then SUCCESS | Payment → SUCCESS, booking **stays CANCELLED**; logged `REFUND_REQUIRED`                                                               | `APPLIED`          |
+
+**Retries are safe because it's one transaction.** Recording the event and applying its effect
+happen in the **same database transaction** (with the booking row locked). If processing fails
+halfway, both roll back and the provider's retry is processed cleanly. If the event were committed
+separately, a crash before the update would make every retry look like a duplicate and the payment
+would never settle. A test simulates exactly this crash.
+
+The webhook **never creates payments or bookings** — it only updates an existing payment and its
+booking — and requires the `X-Webhook-Secret` header. Responses: `200` (applied, duplicate or
+conflict — an error would make the provider retry forever), `400` invalid payload, `401` bad secret,
+`404` unknown `providerPaymentId`, `422` amount mismatch (nothing recorded). An unknown **event ID**
+is not an error: it just means the event is new.
+
+## 9. Edge cases
+
+Every case below has at least one automated test.
+
+| Area      | Case                                                        | Status              | Handled in                                                 |
+| --------- | ----------------------------------------------------------- | ------------------- | ---------------------------------------------------------- |
+| Auth      | Invalid signup payload                                      | 400                 | `validators/auth.validator.ts`                             |
+| Auth      | Duplicate email (any letter case, incl. concurrent signups) | 409                 | lowercased email; unique `users.email`                     |
+| Auth      | Wrong password / unknown email (same message and timing)    | 401                 | `auth.service.ts` (dummy bcrypt compare)                   |
+| Auth      | Password over 72 **bytes** (signup and login)               | 400                 | `auth.validator.ts`                                        |
+| Auth      | `role: ADMIN` in signup body                                | 201 as USER         | Zod strips it; DB default `USER`                           |
+| Auth      | Missing / malformed / invalid / expired JWT, `alg: none`    | 401                 | `middleware/authenticate.ts`, `utils/jwt.ts`               |
+| Catalogue | Malformed UUID / missing fields / bad price                 | 400                 | `validators/centre.validator.ts`; DB CHECK                 |
+| Catalogue | Non-admin write / no token                                  | 403 / 401           | `middleware/requireAdmin.ts`                               |
+| Catalogue | Unknown centre or test                                      | 404                 | `services/centre.service.ts`                               |
+| Catalogue | Duplicate offering, test name, centre                       | 409                 | unique constraints                                         |
+| Bookings  | No token                                                    | 401                 | `routes/booking.routes.ts`                                 |
+| Bookings  | Unknown centre or test                                      | 404                 | `services/booking.service.ts`                              |
+| Bookings  | Test not offered by the centre                              | 422                 | service check + composite FK                               |
+| Bookings  | Client sends `amount` / `status`                            | 400                 | strict schema                                              |
+| Bookings  | Past / timezone-less / invalid appointment time             | 400                 | `validators/booking.validator.ts`                          |
+| Bookings  | Malformed / unknown booking ID                              | 400 / 404           | validator / owner-filtered query                           |
+| Bookings  | Viewing or cancelling another user's booking                | 404                 | `WHERE id AND user_id` in `booking.repository.ts`          |
+| Bookings  | Cancel twice / cancel FAILED / cancel after appointment     | 409                 | conditional UPDATE + state machine                         |
+| Bookings  | Duplicate active booking (double click)                     | 409                 | partial unique index                                       |
+| Payments  | Unknown booking / another user's booking                    | 404                 | owner-filtered row lock                                    |
+| Payments  | Booking FAILED / CANCELLED / past appointment               | 409                 | state machine check under the lock                         |
+| Payments  | Duplicate payment (incl. while PENDING, incl. concurrent)   | 409                 | row lock + unique `payments.booking_id`                    |
+| Payments  | Client sends `amount`                                       | 400                 | strict schema                                              |
+| Payments  | Failed payment                                              | 201                 | not an error: `status: FAILED`                             |
+| Webhook   | Missing / wrong secret                                      | 401                 | `middleware/verifyWebhookSecret.ts`                        |
+| Webhook   | Invalid payload / `PENDING` status / malformed JSON         | 400                 | strict schema                                              |
+| Webhook   | Unknown `providerPaymentId` / amount mismatch               | 404 / 422           | `services/webhook.service.ts`                              |
+| Webhook   | Repeated SUCCESS / FAILED (incl. concurrent)                | 200                 | unique `provider_event_id`; stored result replayed         |
+| Webhook   | Same outcome, new event ID / conflicting outcome            | 200                 | `settlePayment()` → `DUPLICATE_STATE` / `IGNORED_CONFLICT` |
+| Webhook   | Crash mid-processing                                        | 500, retry succeeds | single transaction rolls back                              |
+| General   | Unknown route or method                                     | 404 (JSON)          | `middleware/notFound.ts`                                   |
+| General   | Body over 100 kb / unsupported encoding                     | 413 / 415           | `middleware/errorHandler.ts`                               |
+| General   | Unexpected / database error                                 | 500                 | generic body; details only in the log                      |
+| General   | Password or hash in any response                            | never               | `select` on user queries; sweep test                       |
+
+## 10. Local setup
+
+**Requirements:** Node.js 20+ and PostgreSQL (developed and tested with Node.js 24 and
+PostgreSQL 18). Commands are for a bash-style shell (Git Bash on Windows); on PowerShell use `copy`
+instead of `cp`.
+
+```bash
+# 1. Install dependencies (also generates the Prisma client via postinstall)
+npm install
+
+# 2. Create a development and a separate test database
+createdb -U postgres eve_healthcare
+createdb -U postgres eve_healthcare_test
+
+# 3. Environment variables — copy the examples and edit the values
+cp .env.example .env              # DATABASE_URL (dev DB), JWT_SECRET, WEBHOOK_SECRET, ADMIN_*
+cp .env.test.example .env.test    # DATABASE_URL must point to the *test* database
+
+# 4. Apply the migrations to both databases
+npm run db:deploy
+npm run db:test:deploy
+
+# 5. Seed: the admin account (from ADMIN_NAME / ADMIN_EMAIL / ADMIN_PASSWORD in .env)
+#    plus 3 centres, 5 tests and 10 offerings with centre-specific prices
+npm run db:seed
+
+# 6. Run
+npm run dev                       # http://localhost:3000/health  (auto-reload)
+npm run build && npm start        # compiled production build
+```
+
+| Variable                                      | Purpose                                                  |
+| --------------------------------------------- | -------------------------------------------------------- |
+| `DATABASE_URL`                                | PostgreSQL connection string                             |
+| `JWT_SECRET`                                  | HS256 signing secret (≥ 16 characters)                   |
+| `JWT_EXPIRES_IN`                              | Token lifetime: `3600`, `15m`, `1h`, `7d` (default `1h`) |
+| `WEBHOOK_SECRET`                              | Shared secret the provider sends in `X-Webhook-Secret`   |
+| `ADMIN_NAME`, `ADMIN_EMAIL`, `ADMIN_PASSWORD` | The admin account created by `npm run db:seed`           |
+| `PORT`, `NODE_ENV`                            | Server port (default 3000) and environment               |
+
+The app validates these at startup and refuses to start if any is missing or invalid. `.env`
+files are git-ignored; only the `.example` files (with placeholder values) are committed.
+
+Other scripts: `npm run lint`, `npm run typecheck`, `npm run format`, `npm run db:migrate`
+(create a new migration after editing `prisma/schema.prisma`).
 
 ### Tests
 
 ```bash
-npm run db:test:deploy          # apply migrations to the test database
-npm test                        # 186 tests (unit + API integration against PostgreSQL)
-npm test -- --coverage          # ~95% statements, ~85% branches
+npm test                          # 186 tests against the test database
+npm test -- --coverage            # ~95% statements, ~85% branches
 ```
 
-Jest + Supertest against a real PostgreSQL test database — no mocks of the database, no test
-containers, fixture libraries or snapshots. One file per module:
-
-| File                 | Covers                                                                  |
-| -------------------- | ----------------------------------------------------------------------- |
-| `foundation.test.ts` | Health, JSON 404, malformed/oversized bodies, error handler, env checks |
-| `auth.test.ts`       | Signup, login, JWT middleware, admin check                              |
-| `catalogue.test.ts`  | Centres, tests, offerings and prices                                    |
-| `bookings.test.ts`   | Booking rules, ownership, cancellation, the booking state machine       |
-| `payments.test.ts`   | Simulated payments, amount integrity, concurrency                       |
-| `webhook.test.ts`    | Webhook settlement, idempotency, conflicts, atomicity, rejection        |
-| `security.test.ts`   | No password or hash in any response                                     |
-| `seed.test.ts`       | The seed script                                                         |
-
-Each test creates its own data with small factories (`tests/helpers/factories.ts`: `createUser`,
-`createCentreWithTest`, `createBookingFor`, `payFor`, `sendWebhook`) — nothing depends on seed
-data. The database is emptied before every test and files run one at a time (`--runInBand`), since
-they share one database. Dates are relative to "now" (always in the future), and there are no
-timing-based waits: races are tested with `Promise.all`, and where timing alone can't reliably hit
-a race branch, one repository call is stubbed to open the race window deterministically.
+Jest + Supertest against a real PostgreSQL test database — no database mocks, test containers,
+fixture libraries or snapshots. One file per module (`foundation`, `auth`, `catalogue`,
+`bookings`, `payments`, `webhook`, `security`, `seed`). Each test creates its own data with small
+factories (`tests/helpers/factories.ts`), the database is emptied before every test, files run one
+at a time (they share one database), dates are relative to "now", and there are no timing-based
+waits — races are tested with `Promise.all`.
 
 ### What the tests prove
 
@@ -68,448 +427,39 @@ a race branch, one repository call is stubbed to open the race window determinis
 | **Webhook authenticity**                                                | `webhook` › _returns 401 for a missing/wrong secret_                                                                                                                                                                                |
 | **No sensitive data leaks**                                             | `security` › _no response … contains a password or password hash_; `foundation` › _error handler_                                                                                                                                   |
 
-### Other scripts
-
-| Script               | Purpose                                     |
-| -------------------- | ------------------------------------------- |
-| `npm run build`      | Compile TypeScript to `dist/`               |
-| `npm start`          | Run the compiled server                     |
-| `npm run lint`       | ESLint                                      |
-| `npm run typecheck`  | Type-check source and tests                 |
-| `npm run db:migrate` | Create a new migration after schema edits   |
-| `npm run db:seed`    | Create/reset the admin account (idempotent) |
-
-## Architecture
-
-```
-Route → Middleware (auth, validate) → Controller → Service → Repository → PostgreSQL
-                                                                  ↓ (any thrown error)
-                                                           errorHandler → JSON error
-```
-
-| Folder          | Responsibility                                                             |
-| --------------- | -------------------------------------------------------------------------- |
-| `config/`       | Environment validation (fails fast on bad config) and the Prisma client    |
-| `routes/`       | URL → handler mapping; attaches auth and validation middleware per route   |
-| `middleware/`   | Cross-cutting concerns: JWT auth, Zod validation, error handling           |
-| `validators/`   | Zod schemas for request bodies, params and queries                         |
-| `controllers/`  | HTTP only: read the validated request, call a service, shape the response  |
-| `services/`     | Business rules: booking state transitions, payment processing, idempotency |
-| `repositories/` | Prisma queries; the only layer that talks to the database                  |
-| `types/`        | Shared types (e.g. `req.user` augmentation)                                |
-| `utils/`        | Small helpers such as `AppError`                                           |
-
-### Response format
-
-Successful responses wrap the payload in `data`:
-
-```json
-{ "data": { "id": "…", "name": "Asha Rao" } }
-```
-
-Every error response has the same shape:
-
-```json
-{ "error": { "code": "VALIDATION_ERROR", "message": "Request validation failed", "details": {} } }
-```
-
-Services throw `AppError` for expected failures. The central `errorHandler` also maps Zod errors,
-request-body errors (malformed JSON, oversized or wrongly encoded bodies) and Prisma's
-unique / not-found / foreign-key errors (`P2002`, `P2025`, `P2003`) to generic messages — Prisma's
-own messages name tables and constraints. Anything else returns a generic 500; the stack trace
-goes only to the (structured JSON) log.
-
-### Status codes
-
-The same meaning everywhere in the API:
-
-| Status | Meaning                                                                                  |
-| ------ | ---------------------------------------------------------------------------------------- |
-| 200    | OK — including a webhook that was applied, a duplicate, or a conflict                    |
-| 201    | Created — including a payment whose outcome is `FAILED`                                  |
-| 202    | Accepted — payment created `PENDING`, awaiting the webhook                               |
-| 400    | Invalid payload, malformed JSON or malformed UUID                                        |
-| 401    | Missing, invalid or expired JWT; missing or wrong webhook secret                         |
-| 403    | Authenticated, but not an admin, on an admin-only write                                  |
-| 404    | Not found — **or owned by another user** (existence is never revealed)                   |
-| 409    | Duplicate record, or a state that doesn't allow the action (invalid transition)          |
-| 413    | Request body larger than 100 kb                                                          |
-| 415    | Unsupported request body encoding                                                        |
-| 422    | Well-formed but invalid combination: test not offered at centre; webhook amount mismatch |
-| 500    | Unexpected error (generic message only)                                                  |
-
-## API endpoints
-
-### Authentication
-
-| Method | Path           | Auth | Description                    |
-| ------ | -------------- | ---- | ------------------------------ |
-| POST   | `/auth/signup` | –    | Register a user                |
-| POST   | `/auth/login`  | –    | Exchange credentials for a JWT |
-
-Protected endpoints require `Authorization: Bearer <accessToken>`.
-
-**Roles.** Every user is `USER` or `ADMIN`. Signup always creates a `USER` (a `role` field in
-the request body is ignored); the only admin is created by `npm run db:seed`. Admin-only routes use
-`authenticate` (who are you? → 401) followed by `requireAdmin` (are you allowed? → 403).
-
-```bash
-curl -X POST http://localhost:3000/auth/signup \
-  -H "Content-Type: application/json" \
-  -d '{"name":"Asha Rao","email":"asha@example.com","password":"password123"}'
-# 201 { "data": { "id": "…", "name": "Asha Rao", "email": "asha@example.com", "createdAt": "…" } }
-
-curl -X POST http://localhost:3000/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"asha@example.com","password":"password123"}'
-# 200 { "data": { "accessToken": "eyJ…", "tokenType": "Bearer", "expiresIn": "1h", "user": { … } } }
-```
-
-| Situation                                | Status | `error.code`               |
-| ---------------------------------------- | ------ | -------------------------- |
-| Invalid body (bad email, short password) | 400    | `VALIDATION_ERROR`         |
-| Email already registered                 | 409    | `EMAIL_ALREADY_REGISTERED` |
-| Wrong email or password                  | 401    | `INVALID_CREDENTIALS`      |
-| Missing / malformed Authorization header | 401    | `UNAUTHORIZED`             |
-| Invalid or tampered token                | 401    | `INVALID_TOKEN`            |
-| Expired token                            | 401    | `TOKEN_EXPIRED`            |
-| Normal user calls an admin-only route    | 403    | `FORBIDDEN`                |
-
-### Diagnostic centres & tests
-
-Reads are public. Every write requires an admin token (`authenticate` → 401, `requireAdmin` → 403).
-
-| Method | Path                               | Auth  | Description                                         |
-| ------ | ---------------------------------- | ----- | --------------------------------------------------- |
-| POST   | `/centres`                         | Admin | Create a centre `{ name, location }`                |
-| GET    | `/centres`                         | –     | List centres                                        |
-| GET    | `/centres/:centreId`               | –     | Get one centre                                      |
-| POST   | `/tests`                           | Admin | Create a test `{ name, description? }`              |
-| GET    | `/tests`                           | –     | List the test catalogue                             |
-| POST   | `/centres/:centreId/tests`         | Admin | Offer a test at a centre `{ testId, pricePaise }`   |
-| GET    | `/centres/:centreId/tests`         | –     | Tests offered at a centre, with that centre's price |
-| PATCH  | `/centres/:centreId/tests/:testId` | Admin | Change the price `{ pricePaise }`                   |
-
-Prices are **integers in paise**: `49900` = ₹499.00.
-
-```bash
-# Admin: offer a test at a centre
-curl -X POST http://localhost:3000/centres/<centreId>/tests \
-  -H "Authorization: Bearer <adminToken>" -H "Content-Type: application/json" \
-  -d '{"testId":"<testId>","pricePaise":35000}'
-
-# Public: what does this centre offer, and at what price?
-curl http://localhost:3000/centres/<centreId>/tests
-# 200 { "data": [ { "id": "…", "centreId": "…", "pricePaise": 35000,
-#                   "test": { "id": "…", "name": "Complete Blood Count (CBC)", "description": "…" } } ] }
-```
-
-| Situation                                     | Status | `error.code`       |
-| --------------------------------------------- | ------ | ------------------ |
-| Invalid UUID in the path, bad body, price ≤ 0 | 400    | `VALIDATION_ERROR` |
-| No token on a write                           | 401    | `UNAUTHORIZED`     |
-| Normal user attempts a write                  | 403    | `FORBIDDEN`        |
-| Centre, test or offering not found            | 404    | `NOT_FOUND`        |
-| Duplicate test name, centre, or offering      | 409    | `CONFLICT`         |
-
-There are deliberately **no DELETE endpoints** — see Assumptions.
-
-### Bookings
-
-All booking routes require a token. Every user — including admins — only ever sees and cancels
-**their own** bookings.
-
-| Method | Path                   | Description                                      |
-| ------ | ---------------------- | ------------------------------------------------ |
-| POST   | `/bookings`            | Book `{ centreId, testId, appointmentDateTime }` |
-| GET    | `/bookings`            | The caller's bookings, newest first              |
-| GET    | `/bookings/:id`        | One of the caller's bookings                     |
-| PATCH  | `/bookings/:id/cancel` | Cancel one of the caller's bookings              |
-
-```bash
-curl -X POST http://localhost:3000/bookings \
-  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"centreId":"<centreId>","testId":"<testId>","appointmentDateTime":"2030-01-15T10:00:00+05:30"}'
-# 201 { "data": { "id": "…", "status": "PENDING", "amountPaise": 35000,
-#                 "appointmentDateTime": "2030-01-15T04:30:00.000Z",
-#                 "centre": { "id": "…", "name": "HealthFirst Diagnostics", "location": "…" },
-#                 "test": { "id": "…", "name": "Complete Blood Count (CBC)" }, … } }
-```
-
-The amount is **always** the centre's current price for that test; the request body is strict,
-so sending `amount`, `amountPaise` or `status` is rejected with 400.
-
-**Booking status rules** (defined once in `src/utils/bookingStatus.ts`):
-
-```
-PENDING ──payment succeeds──► CONFIRMED ──user cancels──► CANCELLED   (no refund; out of scope)
-   │  └──payment fails──────► FAILED       (terminal)
-   └──────user cancels──────► CANCELLED    (terminal)
-```
-
-| Situation                                                           | Status | `error.code`                |
-| ------------------------------------------------------------------- | ------ | --------------------------- |
-| Malformed id, bad/past/timezone-less time, unknown field (`amount`) | 400    | `VALIDATION_ERROR`          |
-| No token                                                            | 401    | `UNAUTHORIZED`              |
-| Booking doesn't exist **or belongs to another user**                | 404    | `NOT_FOUND`                 |
-| Centre or test in the body doesn't exist                            | 404    | `NOT_FOUND`                 |
-| Centre exists and test exists, but the centre doesn't offer it      | 422    | `TEST_NOT_OFFERED`          |
-| Same user, centre, test and time already booked (active)            | 409    | `DUPLICATE_BOOKING`         |
-| Cancelling a CANCELLED or FAILED booking                            | 409    | `INVALID_STATUS_TRANSITION` |
-| Cancelling after the appointment time                               | 409    | `APPOINTMENT_PASSED`        |
-
-Another user's booking returns **404, not 403**, so the API never reveals that a booking ID exists.
-This is enforced in the query itself (`WHERE id = ? AND user_id = ?`), not by fetching and comparing.
-
-Booking responses include the booking's `payment` (`id`, `status`, `providerPaymentId`,
-`amountPaise`) once it has been paid, or `null`.
-
-### Payments (simulated)
-
-There is **no real payment gateway**. A mock provider stands in for one.
-
-| Method | Path                 | Auth           | Description                                                            |
-| ------ | -------------------- | -------------- | ---------------------------------------------------------------------- |
-| POST   | `/payments`          | User           | Pay for one of your PENDING bookings `{ bookingId, simulateOutcome? }` |
-| POST   | `/payments/webhook/` | Webhook secret | Provider notifies the payment outcome (see next section)               |
-
-A payment can be settled in two ways, and **both go through one shared function**
-(`settlePayment()` in `src/services/paymentSettlement.ts`):
-
-1. **Immediately** — send `simulateOutcome: "SUCCESS" | "FAILED"`. The mock settles the payment in
-   the same request → `201`.
-2. **Later, via the webhook** — omit `simulateOutcome`. The payment is created `PENDING`, the booking
-   stays `PENDING`, and the response is `202 Accepted`. The provider's webhook settles it.
-
-```bash
-# Settle via the webhook (like a real gateway)
-curl -X POST http://localhost:3000/payments \
-  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"bookingId":"<bookingId>"}'
-# 202 { "data": { "id": "…", "amountPaise": 35000, "status": "PENDING",
-#                 "providerPaymentId": "mock_pay_…", "booking": { "id": "…", "status": "PENDING" } } }
-
-# Or settle immediately
-curl -X POST http://localhost:3000/payments \
-  -H "Authorization: Bearer <token>" -H "Content-Type: application/json" \
-  -d '{"bookingId":"<bookingId>","simulateOutcome":"SUCCESS"}'
-# 201 { "data": { …, "status": "SUCCESS", "booking": { "id": "…", "status": "CONFIRMED" } } }
-```
-
-- Letting the client choose the outcome is acceptable **only because this is a mock** (it makes the
-  behaviour deterministic for testing). With a real gateway the provider decides.
-- The amount is always the booking's `amountPaise`. Sending `amount` is rejected with 400.
-- **A failed payment is still a successful request**: `201` with `"status": "FAILED"`, and the
-  booking becomes `FAILED`. 4xx codes are reserved for requests that could not be processed.
-- SUCCESS → booking `CONFIRMED`; FAILED → booking `FAILED` (terminal: the user books again).
-
-| Situation                                               | Status | `error.code`             |
-| ------------------------------------------------------- | ------ | ------------------------ |
-| Missing/malformed `bookingId`, unknown field (`amount`) | 400    | `VALIDATION_ERROR`       |
-| No token                                                | 401    | `UNAUTHORIZED`           |
-| Booking doesn't exist or belongs to another user        | 404    | `NOT_FOUND`              |
-| Booking already has a payment (PENDING or CONFIRMED)    | 409    | `PAYMENT_ALREADY_EXISTS` |
-| Booking is FAILED or CANCELLED                          | 409    | `BOOKING_NOT_PAYABLE`    |
-| Appointment time has passed                             | 409    | `APPOINTMENT_PASSED`     |
-
-### Payment webhook
-
-`POST /payments/webhook/` is called by the payment provider, not by users. It requires the header
-`X-Webhook-Secret: <WEBHOOK_SECRET>` (compared in constant time with `crypto.timingSafeEqual`);
-without it anyone could "confirm" any booking.
-
-```bash
-curl -X POST http://localhost:3000/payments/webhook/ \
-  -H "X-Webhook-Secret: <WEBHOOK_SECRET>" -H "Content-Type: application/json" \
-  -d '{"eventId":"evt_123","providerPaymentId":"mock_pay_…","status":"SUCCESS","amount":35000}'
-# 200 { "data": { "eventId": "evt_123", "providerPaymentId": "mock_pay_…",
-#                 "status": "SUCCESS", "outcome": "APPLIED" } }
-```
-
-The payload is strict: `eventId`, `providerPaymentId` (the provider's own reference — it doesn't know
-our booking IDs), `status` (`SUCCESS` | `FAILED`) and `amount` (paise). **The webhook never creates
-payments or bookings; it only updates an existing payment and its booking.**
-
-**Idempotency works at two levels:**
-
-1. **Same event delivered again** (same `eventId`): `payment_events.provider_event_id` is UNIQUE, so
-   the event can never be recorded or applied twice. The stored result is returned (identical `200`
-   response every time). If the same `eventId` arrives with a _different_ body, the first delivery
-   counts: the stored result is returned and a warning is logged.
-2. **Same outcome under a new event ID** (the provider re-sends): the event is recorded, but
-   `settlePayment()` sees the payment is already in that status and changes nothing →
-   `outcome: "DUPLICATE_STATE"`.
-
-Every event is stored with what happened to it (`outcome`):
-
-| Situation                                     | Result                                                                                                                                    | `outcome`          |
-| --------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------- | ------------------ |
-| PENDING payment + SUCCESS / FAILED            | Payment settled; booking → CONFIRMED / FAILED                                                                                             | `APPLIED`          |
-| Payment already in the reported status        | Nothing changes                                                                                                                           | `DUPLICATE_STATE`  |
-| Payment SUCCESS, then a FAILED event          | Keeps SUCCESS; warning logged                                                                                                             | `IGNORED_CONFLICT` |
-| Payment FAILED, then a SUCCESS event          | Keeps FAILED (terminal); logged as `MANUAL_RECONCILIATION_REQUIRED` — in a real system money was taken, so a human must refund or confirm | `IGNORED_CONFLICT` |
-| Booking CANCELLED while pending, then SUCCESS | Payment → SUCCESS, booking **stays CANCELLED**; logged as `REFUND_REQUIRED`                                                               | `APPLIED`          |
-
-| Situation                                  | Status | Why                                                                   |
-| ------------------------------------------ | ------ | --------------------------------------------------------------------- |
-| Applied, duplicate or conflict             | 200    | An error would make the provider retry an event that will never apply |
-| Invalid payload or status (e.g. `PENDING`) | 400    | `VALIDATION_ERROR`                                                    |
-| Missing or wrong secret                    | 401    | `INVALID_WEBHOOK_SECRET`                                              |
-| Unknown `providerPaymentId`                | 404    | `NOT_FOUND`                                                           |
-| `amount` doesn't match the payment         | 422    | `AMOUNT_MISMATCH` — nothing recorded or applied                       |
-
-An unknown **event ID** is not an error — it simply means the event is new.
-
-**Retry handling without retry infrastructure.** Recording the event and applying its effect happen
-in **one database transaction**. If processing fails halfway (crash, DB error), both are rolled
-back and the provider — which retries until it gets a 2xx — redelivers the event, which is then
-processed cleanly. If the event row were committed separately, a crash before the update would make
-every retry look like a duplicate and the payment would never settle. (A test simulates exactly
-this crash.)
-
-## Edge cases
-
-Every case below has at least one automated test (`tests/`).
-
-| Area      | Case                                                        | Status              | Handled in                                                      |
-| --------- | ----------------------------------------------------------- | ------------------- | --------------------------------------------------------------- |
-| Auth      | Invalid signup payload                                      | 400                 | `validators/auth.validator.ts`                                  |
-| Auth      | Duplicate email (any letter case)                           | 409                 | email lowercased in validator; unique `users.email`             |
-| Auth      | Duplicate email, concurrent signups                         | 409                 | unique constraint, caught in `auth.service.ts`                  |
-| Auth      | Wrong password / unknown email (same message and timing)    | 401                 | `auth.service.ts` (dummy bcrypt compare)                        |
-| Auth      | Password over 72 **bytes** (bcrypt limit), signup and login | 400                 | `auth.validator.ts`                                             |
-| Auth      | `role: ADMIN` in signup body                                | 201 as USER         | Zod strips it; DB default `USER`                                |
-| Auth      | Missing / malformed / invalid / expired JWT, `alg: none`    | 401                 | `middleware/authenticate.ts`, `utils/jwt.ts` (HS256 pinned)     |
-| Catalogue | Malformed UUID / missing fields / bad price                 | 400                 | `validators/centre.validator.ts`; DB `CHECK (price > 0)`        |
-| Catalogue | Non-admin write / no token                                  | 403 / 401           | `middleware/requireAdmin.ts`                                    |
-| Catalogue | Unknown centre or test                                      | 404                 | `services/centre.service.ts`                                    |
-| Catalogue | Duplicate offering, test name, centre                       | 409                 | unique constraints, caught in services                          |
-| Bookings  | No token                                                    | 401                 | `routes/booking.routes.ts`                                      |
-| Bookings  | Unknown centre or test                                      | 404                 | `services/booking.service.ts`                                   |
-| Bookings  | Test not offered by the centre                              | 422                 | service check + composite FK to the offering                    |
-| Bookings  | Client sends `amount` / `status`                            | 400                 | strict schema                                                   |
-| Bookings  | Past / timezone-less / invalid appointment time             | 400                 | `validators/booking.validator.ts`                               |
-| Bookings  | Malformed / unknown booking ID                              | 400 / 404           | validator / owner-filtered query                                |
-| Bookings  | Viewing or cancelling another user's booking                | 404                 | `WHERE id AND user_id` in `booking.repository.ts`               |
-| Bookings  | Cancel twice / cancel FAILED / cancel after appointment     | 409                 | conditional UPDATE + `utils/bookingStatus.ts`                   |
-| Bookings  | Duplicate active booking (double click)                     | 409                 | partial unique index                                            |
-| Payments  | Unknown booking / another user's booking                    | 404                 | `lockForUser` in `payment.service.ts`                           |
-| Payments  | Booking FAILED / CANCELLED / past appointment               | 409                 | state machine check under row lock                              |
-| Payments  | Duplicate payment (incl. while PENDING, incl. concurrent)   | 409                 | row lock + unique `payments.booking_id`                         |
-| Payments  | Client sends `amount`                                       | 400                 | strict schema (amount always comes from the booking)            |
-| Payments  | Failed payment                                              | 201                 | not an error: `status: FAILED`, booking `FAILED`                |
-| Webhook   | Missing / wrong secret                                      | 401                 | `middleware/verifyWebhookSecret.ts` (timing-safe)               |
-| Webhook   | Invalid payload / `PENDING` status / malformed JSON         | 400                 | `paymentWebhookSchema` (strict)                                 |
-| Webhook   | Unknown event ID                                            | 200                 | not an error — a new event                                      |
-| Webhook   | Unknown `providerPaymentId`                                 | 404                 | `webhook.service.ts`                                            |
-| Webhook   | Amount mismatch                                             | 422                 | `webhook.service.ts`, nothing recorded                          |
-| Webhook   | Repeated SUCCESS / FAILED (same event ID, incl. concurrent) | 200                 | unique `provider_event_id`; stored result replayed              |
-| Webhook   | Same outcome, new event ID                                  | 200                 | `settlePayment()` → `DUPLICATE_STATE`                           |
-| Webhook   | Conflicting outcome / payment for a cancelled booking       | 200                 | `settlePayment()` → `IGNORED_CONFLICT` / booking kept CANCELLED |
-| Webhook   | Crash mid-processing                                        | 500, retry succeeds | single transaction rolls back                                   |
-| General   | Unknown route or method                                     | 404 (JSON)          | `middleware/notFound.ts`                                        |
-| General   | Body over 100 kb / unsupported encoding                     | 413 / 415           | `middleware/errorHandler.ts`                                    |
-| General   | Unexpected / database error                                 | 500                 | generic body; details only in logs                              |
-| General   | Password or hash in any response                            | never               | `select` on user queries; sweep test over all responses         |
-
-### Transaction boundaries
-
-| Operation                                  | Mechanism                                                         | Why                                                       |
-| ------------------------------------------ | ----------------------------------------------------------------- | --------------------------------------------------------- |
-| Payment (`POST /payments`)                 | Interactive transaction + `SELECT … FOR UPDATE` on booking        | Several reads and two writes depend on current status     |
-| Webhook processing                         | Transaction + booking row lock; event row in the same transaction | A crash can never leave an event recorded but not applied |
-| Cancellation                               | One conditional `UPDATE … WHERE status IN (…)`                    | A single statement is already atomic                      |
-| Signup, catalogue writes, booking creation | Single `INSERT`, guarded by unique constraints / FKs              | One statement is atomic; no multi-step invariant          |
-
-## Database design
-
-```
-diagnostic_centres ──< centre_test_offerings >── diagnostic_tests
-                              │
-users ──────────────────< bookings ──── payments ──< payment_events
-                                    (1 : 0..1)
-```
-
-| Table                   | Notes                                                                                                     |
-| ----------------------- | --------------------------------------------------------------------------------------------------------- |
-| `users`                 | Name, unique lowercase email, bcrypt password hash, role (`USER`/`ADMIN`)                                 |
-| `diagnostic_centres`    | Name + free-text location; unique `(name, location)`                                                      |
-| `diagnostic_tests`      | Catalogue of test types (unique name, optional description)                                               |
-| `centre_test_offerings` | Which centre offers which test, at what `price_paise`; unique `(centre_id, test_id)`                      |
-| `bookings`              | User, centre, test, `appointment_date_time`, `amount_paise` snapshot, status enum                         |
-| `payments`              | One per booking (unique `booking_id`); amount, `PENDING`/`SUCCESS`/`FAILED`, unique `provider_payment_id` |
-| `payment_events`        | One row per provider event: unique `provider_event_id`, status, `outcome`, raw JSON `payload`             |
-
-Key decisions:
-
-- **Price belongs to the offering, not the test.** The same test can cost different amounts at
-  different centres (the seed data shows CBC at ₹350, ₹399 and ₹420).
-- **Money is stored as integers in paise** (`price_paise`, `amount_paise`) to avoid
-  floating-point rounding. Zod rejects non-integer or non-positive prices, and hand-written
-  `CHECK (> 0)` constraints in the migration SQL enforce the same rule in the database (Prisma's
-  schema language cannot express CHECK constraints).
-- **Booking amount is a snapshot** of the centre's price at booking time, so later price changes
-  do not alter existing bookings.
-- **Bookings store `centre_id` + `test_id` with a composite foreign key** to the offering's unique
-  `(centre_id, test_id)`. The database itself guarantees that a booking is only ever for a test the
-  centre actually offers.
-- **Duplicate active bookings are blocked** by a partial unique index on
-  `(user_id, centre_id, test_id, appointment_date_time) WHERE status IN ('PENDING','CONFIRMED')`.
-  A cancelled or failed slot can be booked again.
-- **Cancellation is atomic**: a single conditional `UPDATE … WHERE id AND user_id AND status IN
-(PENDING, CONFIRMED) AND appointment in the future`, so it cannot race with a payment update.
-- **No payment columns on `bookings`.** The payment row points to the booking.
-- **All foreign keys are `ON DELETE RESTRICT`**: a centre, test or offering that bookings refer to
-  can never be deleted out from under them.
-- **One payment per booking** (unique `payments.booking_id`). Because FAILED bookings are terminal,
-  a booking is never paid twice, and the database itself blocks double payment.
-- **Row locking.** `POST /payments` and the webhook both lock the booking row
-  (`SELECT … FOR UPDATE`) inside their transaction, in the same order, and re-read the payment after
-  taking the lock. Concurrent payments, cancels and webhook deliveries for the same booking are
-  therefore serialised: exactly one wins, the others see its result.
-- **Webhook idempotency is enforced by the database**: unique `payment_events.provider_event_id`,
-  written in the same transaction as the state change.
-
-## Assumptions
-
-- Emails are case-insensitive: they are trimmed and lowercased before being stored or looked up.
-- Passwords must be at least 8 characters and at most 72 **bytes** (bcrypt ignores anything
-  beyond 72 bytes; a multi-byte character such as `é` counts as 2). The limit applies at login too.
-- No `helmet`, CORS or rate limiting: the API returns only JSON and has no browser front end in
-  scope; the `X-Powered-By` header is disabled.
-- Login returns the same error for an unknown email and a wrong password, so the API does not
-  reveal which emails are registered.
-- A JWT is trusted until it expires (default 1 hour); there are no refresh tokens or revocation.
-  The role is stored in the token, so a role change takes effect at the user's next login.
-- There is a single seeded admin; there is no API to promote users.
-- A centre's location is a single free-text string (no structured address or geolocation).
-- Centre uniqueness is `(name, location)`: the same chain may have several branches. Name
-  uniqueness for tests and centres is case-sensitive.
-- Prices are between 1 paise and ₹1,00,000 (`10000000` paise).
-- **No DELETE endpoints.** Once bookings reference an offering, deleting its centre or test would
-  either fail or erase booking history. Removing items from sale would be done with an "active" flag,
-  which is out of scope.
-- Changing a price (PATCH) only affects future bookings; existing bookings keep their snapshot.
-- Timestamps are stored as `timestamptz`. `appointmentDateTime` must be ISO 8601 **with a
-  timezone** (`Z` or `+05:30`) and in the future; responses are in UTC.
-- There is no slot/capacity management: any future time is bookable.
-- Admins have no special access to bookings; they see only their own.
-- A booking cannot be cancelled after its appointment time. Cancelling a CONFIRMED booking does not
-  trigger a refund (refunds are out of scope).
-- All amounts are in Indian rupees (paise); there is no currency column.
-- Payment retries on the same booking are not supported: after a failed payment the booking is
-  FAILED and the user books again.
-- Refunds and manual reconciliation are out of scope; the cases that would need them are logged
-  (`REFUND_REQUIRED`, `MANUAL_RECONCILIATION_REQUIRED`).
-- The webhook is authenticated with a shared secret header. Real providers usually sign the raw body
-  with HMAC instead (see improvements).
-
-## What I would improve with more time
-
-- **HMAC-signed webhooks**: verify a signature over the raw request body (as Razorpay/Stripe do)
-  instead of a static shared secret, plus a timestamp to reject replayed old requests.
-- An `Idempotency-Key` header on `POST /payments`, so a client retrying after a network timeout gets
-  the original payment back instead of a 409.
-- A real gateway integration would call the provider **outside** the database transaction (never hold
-  a row lock during a network call) and rely on the webhook to settle.
-- A reconciliation job/report for `REFUND_REQUIRED` and `MANUAL_RECONCILIATION_REQUIRED` cases.
+## 11. Assumptions
+
+- **Roles:** there is one admin, created by the seed script; only admins manage centres, tests and
+  prices. There is no API to promote users. The role is read from the JWT, so a role change applies
+  at the next login.
+- **Ownership:** another user's booking returns 404, not 403. Admins have no special access to
+  bookings.
+- **Payments:** one payment per booking. A **FAILED booking is terminal** — the user creates a new
+  booking to try again. `simulateOutcome` is chosen by the client **only because the provider is a
+  mock**; omitting it leaves the payment PENDING for the webhook.
+- **Cancellation:** allowed from PENDING or CONFIRMED and before the appointment time. Cancelling a
+  CONFIRMED booking does **not** refund (refunds are out of scope).
+- **Duplicates:** the same user can't hold two active (PENDING/CONFIRMED) bookings for the same
+  test, centre and time.
+- **Webhooks:** conflicts are recorded and logged, never applied (table in section 8). For the same
+  event ID with a different body, the first delivery counts. Authentication is a shared secret header.
+- **Money** is INR in integer paise, from 1 paise to ₹1,00,000 per offering; no currency column.
+- **Time:** stored as `timestamptz`; `appointmentDateTime` must be ISO 8601 **with a timezone** and
+  in the future; responses are in UTC. There is no slot or capacity management.
+- **Catalogue:** a centre's `location` is free text; centres are unique by (name, location) so a chain
+  can have several branches; names are case-sensitive. There are **no DELETE endpoints** — removing
+  data that bookings reference would break booking history (an "active" flag would be the way).
+- **Auth:** emails are case-insensitive; passwords are 8 characters to 72 bytes; tokens last 1 hour
+  with no refresh tokens or revocation.
+- No helmet, CORS or rate limiting: the API returns only JSON and has no browser front end in scope.
+
+## 12. What I would improve with more time
+
+- **`Idempotency-Key` header on `POST /payments`**, so a client retrying after a timeout gets the
+  original payment instead of a 409.
+- **Refunds** for cancelled CONFIRMED bookings and for `REFUND_REQUIRED` events.
+- **A reconciliation job/report** for `IGNORED_CONFLICT` and `MANUAL_RECONCILIATION_REQUIRED` events.
+- **HMAC-signed webhooks** (signature over the raw body plus a timestamp) instead of a static shared
+  secret; with a real gateway, call the provider outside the database transaction.
+- **Operational extras:** Docker Compose, OpenAPI documentation, pagination, rate limiting, and
+  caching of the public catalogue (e.g. Redis).
